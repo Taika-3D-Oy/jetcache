@@ -51,10 +51,28 @@ pub fn new_shared_catalog(catalog: Catalog) -> SharedCatalog {
     Rc::new(RefCell::new(catalog))
 }
 
+/// Constant-time byte-slice equality. Prevents timing-based token oracle attacks (S-03).
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
 // ── Handler ────────────────────────────────────────────────────────
 
 /// Handle a single incoming NATS message.
-pub async fn handle(client: &Client, db: &LatticeDb, catalog: &SharedCatalog, msg: Message) {
+pub async fn handle(
+    client: &Client,
+    db: &LatticeDb,
+    catalog: &SharedCatalog,
+    msg: Message,
+    expected_auth: Option<&str>,
+) {
     let Some(reply_to) = msg.reply_to.as_deref() else {
         return; // no reply subject, nothing to respond to
     };
@@ -67,6 +85,15 @@ pub async fn handle(client: &Client, db: &LatticeDb, catalog: &SharedCatalog, ms
             return;
         }
     };
+
+    // Check auth if configured (LDB-04).
+    if let Some(expected) = expected_auth {
+        let provided = req._auth.as_deref().unwrap_or("");
+        if !ct_eq(provided.as_bytes(), expected.as_bytes()) {
+            reply_error(client, reply_to, "unauthorized");
+            return;
+        }
+    }
 
     // Parse SQL.
     let stmt = match parser::parse(&req.sql) {
@@ -127,4 +154,22 @@ fn reply_error(client: &Client, reply_to: &str, error: &str) {
     };
     let payload = serde_json::to_vec(&resp).unwrap_or_default();
     let _ = client.publish(reply_to, &payload);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ct_eq_equal() {
+        assert!(ct_eq(b"secret-token", b"secret-token"));
+        assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn test_ct_eq_different() {
+        assert!(!ct_eq(b"secret-token", b"wrong-token!"));
+        assert!(!ct_eq(b"secret", b"secrets"));
+        assert!(!ct_eq(b"secret", b""));
+    }
 }

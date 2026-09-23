@@ -1,6 +1,6 @@
 [package]
 name = "storage-service"
-version = "1.11.0"
+version = "1.11.1"
 edition = "2021"
 description = "Self-contained distributed database service — connects to NATS, serves requests, persists to KV"
 license = "Apache-2.0"
@@ -9,7 +9,7 @@ autobins = false
 [lib]
 name = "storage_service"
 path = "src/main.rs"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 wit-bindgen = { version = "0.57", default-features = false, features = ["macros", "async-spawn"] }

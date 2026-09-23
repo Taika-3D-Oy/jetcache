@@ -1,6 +1,6 @@
 [package]
 name = "lattice-sql"
-version = "1.11.0"
+version = "1.11.1"
 edition = "2021"
 description = "SQL frontend for lattice-db — parses SQL, plans queries, executes against storage-service over NATS"
 license = "Apache-2.0"

@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.11.1] - 2026-09-23
+
+### Security
+
+- **Plaintext Change Event Redaction (LDB-01)**:
+  - Redacted plaintext values from NATS change event notifications (`{instance}-events.{table}.{key}`) for tables configured with encryption across `put`, `cas`, `create`, `batch_put`, and `schedule_fire`.
+- **JetStream WAL Record Encryption (LDB-02)**:
+  - Encrypted WAL transaction prepare records and before-state rollback snapshots using table-derived AES-256-GCM envelope encryption.
+- **Schedule Fire Hardening (LDB-03)**:
+  - Added reserved-table protection, write bounds enforcement (table, key, and 1 MiB value limits), schema validation, and change event value redaction to scheduled write callbacks.
+- **Constant-Time Token Authentication in `lattice-sql` (LDB-04)**:
+  - Added `LDB_AUTH_TOKEN` verification using constant-time byte comparisons (`ct_eq`) and propagated credentials from the SQL service to `storage-service`.
+- **Localhost TCP Server DoS & Memory Protection (LDB-06)**:
+  - Added an explicit ~1.06 MiB frame ceiling (`MAX_TCP_FRAME_LEN`) to prevent unbounded memory allocation from malformed or oversized length prefixes.
+- **Upfront Transaction Validation (LDB-07)**:
+  - Enforced table/key/value write bounds and JSON schema validation upfront in multi-operation transactions prior to WAL logging.
+- **Catalog Namespace Isolation (LDB-09)**:
+  - Allowed `_sql_catalog` under reserved-table validation while preserving strict isolation of internal system tables (`_schemas`, `_indexes`, `_meta`, `_recovery-locks`).
+
+### Fixed
+
+- **SDK Documentation Tests**:
+  - Corrected `nats_wasi` crate imports in doctests for `lattice-db-client` and `lattice-sql-client`.
+
 ## [1.11.0] - 2026-08-31
 
 ### Added

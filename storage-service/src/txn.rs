@@ -219,10 +219,24 @@ pub async fn execute(
                     return Err(format!("{} requires a value (key: {})", op.op, op.key));
                 }
                 // Validate base64
-                B64.decode(op.value.as_ref().unwrap())
+                let val_bytes = B64
+                    .decode(op.value.as_ref().unwrap())
                     .map_err(|e| format!("base64 for {}: {e}", op.key))?;
+                // S-04: validate bounds
+                crate::handler::validate_write_bounds(&op.table, &op.key, &val_bytes)?;
+                // Validate schema if defined
+                if let Some(schema) = state
+                    .borrow()
+                    .tables
+                    .get(&op.table)
+                    .and_then(|t| t.schema.as_ref())
+                {
+                    crate::state::validate_schema(&val_bytes, schema)?;
+                }
             }
-            "delete" => {}
+            "delete" => {
+                crate::handler::validate_write_bounds(&op.table, &op.key, &[])?;
+            }
             other => return Err(format!("unsupported txn op: {other}")),
         }
     }
@@ -232,19 +246,38 @@ pub async fn execute(
     for op in &req.ops {
         ensure_loaded(&op.table, state, store).await?;
 
+        let encrypted = state.borrow().is_encrypted(&op.table);
+
         let (before_value, before_revision) = {
             let s = state.borrow();
             match s.tables.get(&op.table).and_then(|t| t.data.get(&op.key)) {
-                Some(row) => (Some(B64.encode(&row.value)), Some(row.revision)),
+                Some(row) => {
+                    let store_bytes =
+                        crate::handler::maybe_encrypt(&op.table, &op.key, &row.value, encrypted);
+                    (Some(B64.encode(&store_bytes)), Some(row.revision))
+                }
                 None => (None, None),
             }
+        };
+
+        let value_b64 = match &op.value {
+            Some(v) => {
+                if encrypted {
+                    let plain = B64.decode(v).map_err(|e| format!("{e}"))?;
+                    let enc = crate::handler::maybe_encrypt(&op.table, &op.key, &plain, true);
+                    Some(B64.encode(&enc))
+                } else {
+                    Some(v.clone())
+                }
+            }
+            None => None,
         };
 
         wal_ops.push(WalOp {
             op: op.op.clone(),
             table: op.table.clone(),
             key: op.key.clone(),
-            value_b64: op.value.clone(),
+            value_b64,
             before_value,
             before_revision,
             applied_revision: None,
@@ -616,12 +649,17 @@ async fn apply_op(state: &SharedState, store: &SharedStore, wal_op: &WalOp) -> R
 
     match wal_op.op.as_str() {
         "put" => {
-            let value = B64
+            let store_bytes = B64
                 .decode(wal_op.value_b64.as_ref().unwrap())
                 .map_err(|e| format!("base64: {e}"))?;
             let encrypted = state.borrow().is_encrypted(&wal_op.table);
-            let store_bytes =
-                crate::handler::maybe_encrypt(&wal_op.table, &wal_op.key, &value, encrypted);
+            let plain_bytes = crate::handler::maybe_decrypt(
+                &wal_op.table,
+                &wal_op.key,
+                store_bytes.clone(),
+                encrypted,
+            )
+            .map_err(|e| format!("decrypt: {e}"))?;
             let rev = kv
                 .put(&wal_op.key, &store_bytes)
                 .await
@@ -629,16 +667,21 @@ async fn apply_op(state: &SharedState, store: &SharedStore, wal_op: &WalOp) -> R
             state
                 .borrow_mut()
                 .table(&wal_op.table)
-                .upsert(&wal_op.key, value, rev);
+                .upsert(&wal_op.key, plain_bytes, rev);
             Ok(rev)
         }
         "create" => {
-            let value = B64
+            let store_bytes = B64
                 .decode(wal_op.value_b64.as_ref().unwrap())
                 .map_err(|e| format!("base64: {e}"))?;
             let encrypted = state.borrow().is_encrypted(&wal_op.table);
-            let store_bytes =
-                crate::handler::maybe_encrypt(&wal_op.table, &wal_op.key, &value, encrypted);
+            let plain_bytes = crate::handler::maybe_decrypt(
+                &wal_op.table,
+                &wal_op.key,
+                store_bytes.clone(),
+                encrypted,
+            )
+            .map_err(|e| format!("decrypt: {e}"))?;
             let rev = kv
                 .create(&wal_op.key, &store_bytes)
                 .await
@@ -646,7 +689,7 @@ async fn apply_op(state: &SharedState, store: &SharedStore, wal_op: &WalOp) -> R
             state
                 .borrow_mut()
                 .table(&wal_op.table)
-                .upsert(&wal_op.key, value, rev);
+                .upsert(&wal_op.key, plain_bytes, rev);
             Ok(rev)
         }
         "delete" => {
@@ -684,20 +727,21 @@ async fn rollback(state: &SharedState, store: &SharedStore, ops: &[WalOp]) -> Re
                 }
                 match (&wal_op.before_value, wal_op.before_revision) {
                     (Some(before_b64), Some(_before_rev)) => {
-                        let old_value = B64
+                        let store_bytes = B64
                             .decode(before_b64)
                             .map_err(|e| format!("rollback base64: {e}"))?;
                         let encrypted = state.borrow().is_encrypted(&wal_op.table);
-                        let store_bytes = crate::handler::maybe_encrypt(
+                        let plain_bytes = crate::handler::maybe_decrypt(
                             &wal_op.table,
                             &wal_op.key,
-                            &old_value,
+                            store_bytes.clone(),
                             encrypted,
-                        );
+                        )
+                        .map_err(|e| format!("rollback decrypt: {e}"))?;
                         if let Ok(rev) = kv.put(&wal_op.key, &store_bytes).await {
                             state.borrow_mut().table(&wal_op.table).upsert(
                                 &wal_op.key,
-                                old_value,
+                                plain_bytes,
                                 rev,
                             );
                         }
@@ -711,21 +755,22 @@ async fn rollback(state: &SharedState, store: &SharedStore, ops: &[WalOp]) -> Re
             "delete" => {
                 if let (Some(before_b64), Some(_)) = (&wal_op.before_value, wal_op.before_revision)
                 {
-                    let old_value = B64
+                    let store_bytes = B64
                         .decode(before_b64)
                         .map_err(|e| format!("rollback base64: {e}"))?;
                     let encrypted = state.borrow().is_encrypted(&wal_op.table);
-                    let store_bytes = crate::handler::maybe_encrypt(
+                    let plain_bytes = crate::handler::maybe_decrypt(
                         &wal_op.table,
                         &wal_op.key,
-                        &old_value,
+                        store_bytes.clone(),
                         encrypted,
-                    );
+                    )
+                    .map_err(|e| format!("rollback decrypt: {e}"))?;
                     if let Ok(rev) = kv.put(&wal_op.key, &store_bytes).await {
                         state
                             .borrow_mut()
                             .table(&wal_op.table)
-                            .upsert(&wal_op.key, old_value, rev);
+                            .upsert(&wal_op.key, plain_bytes, rev);
                     }
                 }
             }
@@ -789,7 +834,6 @@ async fn ensure_loaded(
 /// Across replicas, collisions are rare due to independent counter evolution,
 /// and idempotent rollback semantics handle them gracefully.
 fn generate_txn_id() -> String {
-    use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 

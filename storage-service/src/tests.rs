@@ -347,6 +347,27 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn test_sql_catalog_allowed() {
+        let payload = br#"{"table":"_sql_catalog","key":"users","value":"e30="}"#;
+        let result = crate::handler::check_no_reserved_tables("put", payload);
+        assert!(result.is_ok());
+
+        let txn_payload =
+            br#"{"ops":[{"op":"put","table":"_sql_catalog","key":"k","value":"e30="}]}"#;
+        let txn_result = crate::handler::check_no_reserved_tables("txn", txn_payload);
+        assert!(txn_result.is_ok());
+    }
+
+    #[test]
+    fn test_is_reserved_table() {
+        assert!(crate::handler::is_reserved_table("_schemas"));
+        assert!(crate::handler::is_reserved_table("_indexes"));
+        assert!(crate::handler::is_reserved_table("_meta"));
+        assert!(!crate::handler::is_reserved_table("_sql_catalog"));
+        assert!(!crate::handler::is_reserved_table("users"));
+    }
+
     // S-03: constant-time auth comparison
 
     #[test]

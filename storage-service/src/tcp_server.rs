@@ -9,7 +9,7 @@
 //! the in-memory cache via virtual pipes (sub-millisecond latency).
 
 use wasip3::sockets::types::{IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, TcpSocket};
-use wasip3::wit_bindgen::{StreamReader, StreamResult, StreamWriter};
+use wasip3::wit_bindgen::{StreamReader, StreamResult};
 use wasip3::wit_stream;
 
 use crate::handler::{self, SharedConfig};
@@ -20,6 +20,9 @@ use nats_wasi::jetstream::JetStream;
 
 /// Default TCP port for the localhost listener.
 const DEFAULT_PORT: u16 = 4080;
+
+/// Maximum allowed frame length over TCP (~1.06 MiB). Prevents unbounded allocation (LDB-06).
+const MAX_TCP_FRAME_LEN: usize = crate::handler::MAX_VALUE_BYTES + 64 * 1024;
 
 /// Start the TCP listener. Spawns a background task that never returns.
 pub fn start(
@@ -107,6 +110,11 @@ async fn handle_connection(
     }
     let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
     buf.drain(..4);
+
+    if len > MAX_TCP_FRAME_LEN {
+        eprintln!("lattice-db: tcp frame length {len} exceeds limit of {MAX_TCP_FRAME_LEN}");
+        return;
+    }
 
     // Read full payload.
     while buf.len() < len {

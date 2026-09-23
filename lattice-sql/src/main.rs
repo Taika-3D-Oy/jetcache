@@ -56,8 +56,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         client.server_info().version,
     );
 
+    // Optional auth token configured for lattice-db (LDB-04).
+    let auth_token: Option<String> = std::env::var("LDB_AUTH_TOKEN").ok();
+
     // Create lattice-db client (talks to storage-service over NATS).
-    let db = LatticeDb::new(client.clone()).with_instance(instance.clone());
+    let mut db = LatticeDb::new(client.clone()).with_instance(instance.clone());
+    if let Some(ref token) = auth_token {
+        db = db.with_auth(token);
+    }
 
     // Load SQL catalog from lattice-db.
     let catalog = catalog::Catalog::load(&db)
@@ -86,10 +92,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let msg = sub.next().await?;
 
         let client = client.clone();
-        let db_handle = LatticeDb::new(client.clone()).with_instance(instance.clone());
+        let mut db_handle = LatticeDb::new(client.clone()).with_instance(instance.clone());
+        if let Some(ref token) = auth_token {
+            db_handle = db_handle.with_auth(token);
+        }
         let cat = shared_catalog.clone();
+        let token_clone = auth_token.clone();
         wasip3::spawn(async move {
-            handler::handle(&client, &db_handle, &cat, msg).await;
+            handler::handle(&client, &db_handle, &cat, msg, token_clone.as_deref()).await;
         });
     }
 }

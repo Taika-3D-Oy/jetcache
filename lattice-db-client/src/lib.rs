@@ -11,7 +11,7 @@
 //! ## Quick start
 //!
 //! ```rust,no_run
-//! use nats_wasip3::client::{Client, ConnectConfig};
+//! use nats_wasi::client::{Client, ConnectConfig};
 //! use lattice_db_client::LatticeDb;
 //!
 //! # async fn example() -> Result<(), lattice_db_client::Error> {

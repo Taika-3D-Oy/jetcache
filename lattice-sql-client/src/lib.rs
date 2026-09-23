@@ -9,7 +9,7 @@
 //! ## Quick start
 //!
 //! ```rust,no_run
-//! use nats_wasip3::client::{Client, ConnectConfig};
+//! use nats_wasi::client::{Client, ConnectConfig};
 //! use lattice_sql_client::LatticeSql;
 //!
 //! # async fn example() -> Result<(), lattice_sql_client::Error> {
@@ -243,7 +243,7 @@ struct AnyResp {
 ///
 /// ```rust,no_run
 /// use lattice_sql_client::LatticeSql;
-/// use nats_wasip3::client::{Client, ConnectConfig};
+/// use nats_wasi::client::{Client, ConnectConfig};
 ///
 /// # async fn example() -> Result<(), lattice_sql_client::Error> {
 /// let client = Client::connect(ConnectConfig::default()).await?;

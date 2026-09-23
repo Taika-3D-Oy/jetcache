@@ -1,6 +1,6 @@
 [package]
 name = "lattice-db-client"
-version = "1.11.0"
+version = "1.11.1"
 edition = "2021"
 description = "Typed Rust client SDK for lattice-db — wraps the NATS request/reply protocol"
 license = "Apache-2.0"

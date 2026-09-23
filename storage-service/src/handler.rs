@@ -34,7 +34,6 @@ use std::sync::OnceLock;
 
 use nats_wasi::client::{secs, Client, Message};
 use nats_wasi::jetstream::JetStream;
-use nats_wasi::schedule::Schedule;
 
 use crate::state::{self, FieldFilter, SharedState};
 use crate::store::SharedStore;
@@ -46,7 +45,7 @@ const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STA
 
 /// Maximum decoded byte size of a value. Rejects oversized writes before they
 /// reach NATS KV, preventing single-request memory exhaustion.
-const MAX_VALUE_BYTES: usize = 1 * 1024 * 1024; // 1 MiB
+pub(crate) const MAX_VALUE_BYTES: usize = 1 * 1024 * 1024; // 1 MiB
 
 /// Maximum byte length of a key.
 const MAX_KEY_LEN: usize = 256;
@@ -1040,7 +1039,7 @@ pub(crate) async fn handle_put(
         "put",
         &req.table,
         &req.key,
-        Some(&req.value),
+        if encrypted { None } else { Some(&req.value) },
         Some(revision),
         instance,
     );
@@ -1250,7 +1249,7 @@ pub(crate) async fn handle_cas(
         "cas",
         &req.table,
         &req.key,
-        Some(&req.value),
+        if encrypted { None } else { Some(&req.value) },
         Some(revision),
         instance,
     );
@@ -1306,7 +1305,7 @@ pub(crate) async fn handle_create(
         "create",
         &req.table,
         &req.key,
-        Some(&req.value),
+        if encrypted { None } else { Some(&req.value) },
         Some(revision),
         instance,
     );
@@ -1669,7 +1668,7 @@ pub(crate) async fn handle_batch_put(
             "put",
             &req.table,
             &entry.key,
-            Some(&entry.value),
+            if encrypted { None } else { Some(&entry.value) },
             Some(revision),
             instance,
         );
@@ -1833,6 +1832,12 @@ pub(crate) async fn handle_schedule_fire(
         }
     };
 
+    // S-01: reject reserved tables.
+    if is_reserved_table(table) {
+        eprintln!("lattice-db: schedule fire: rejected write targeting reserved table {table}");
+        return;
+    }
+
     let fire_body: ScheduleFireBody = match serde_json::from_slice(payload) {
         Ok(b) => b,
         Err(e) => {
@@ -1848,6 +1853,25 @@ pub(crate) async fn handle_schedule_fire(
             return;
         }
     };
+
+    // S-04: validate write bounds before writing.
+    if let Err(e) = validate_write_bounds(table, key, &value) {
+        eprintln!("lattice-db: schedule fire: bounds validation failed for {table}/{key}: {e}");
+        return;
+    }
+
+    // Validate schema if defined for this table.
+    if let Some(schema) = state
+        .borrow()
+        .tables
+        .get(table)
+        .and_then(|t| t.schema.as_ref())
+    {
+        if let Err(e) = crate::state::validate_schema(&value, schema) {
+            eprintln!("lattice-db: schedule fire: schema validation failed for {table}/{key}: {e}");
+            return;
+        }
+    }
 
     let kv = match crate::store::get_or_create_kv(store, table).await {
         Ok(kv) => kv,
@@ -1872,7 +1896,7 @@ pub(crate) async fn handle_schedule_fire(
                 "put",
                 table,
                 key,
-                Some(&fire_body.v),
+                if encrypted { None } else { Some(&fire_body.v) },
                 Some(revision),
                 instance,
             );
@@ -1933,6 +1957,12 @@ fn publish_change(
     }
 }
 
+/// Returns true if the table name is reserved.
+/// `_sql_catalog` is allowed as the catalog store for lattice-sql.
+pub(crate) fn is_reserved_table(table: &str) -> bool {
+    table.starts_with('_') && table != "_sql_catalog"
+}
+
 /// S-01: reject requests targeting reserved (_-prefixed) table names.
 ///
 /// Checked against the raw user-supplied payload, before any partition prefix
@@ -1945,14 +1975,14 @@ pub(crate) fn check_no_reserved_tables(op: &str, payload: &[u8]) -> Result<(), S
         if let Some(ops) = v.get("ops").and_then(|o| o.as_array()) {
             for entry in ops {
                 if let Some(table) = entry.get("table").and_then(|t| t.as_str()) {
-                    if table.starts_with('_') {
+                    if is_reserved_table(table) {
                         return Err(format!("table name '{table}' is reserved"));
                     }
                 }
             }
         }
     } else if let Some(table) = v.get("table").and_then(|t| t.as_str()) {
-        if table.starts_with('_') {
+        if is_reserved_table(table) {
             return Err(format!("table name '{table}' is reserved"));
         }
     }
