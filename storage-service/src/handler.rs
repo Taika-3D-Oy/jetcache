@@ -35,9 +35,8 @@ use std::sync::OnceLock;
 use nats_wasi::client::{secs, Client, Message};
 use nats_wasi::jetstream::JetStream;
 
-use crate::state::{self, FieldFilter, SharedState};
+use crate::state::{self, SharedState};
 use crate::store::SharedStore;
-use crate::txn;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
@@ -95,29 +94,33 @@ pub(crate) fn maybe_decrypt(
     }
 }
 
-fn env_u32(name: &str, default: u32, min: u32, max: u32) -> u32 {
-    let raw = match std::env::var(name) {
-        Ok(v) => v,
-        Err(_) => return default,
-    };
-    let parsed = raw.parse::<u32>().ok().unwrap_or(default);
-    parsed.clamp(min, max)
+fn env_u32(names: &[&str], default: u32, min: u32, max: u32) -> u32 {
+    for name in names {
+        if let Ok(v) = std::env::var(name) {
+            if let Ok(parsed) = v.trim().parse::<u32>() {
+                return parsed.clamp(min, max);
+            }
+        }
+    }
+    default
 }
 
-fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
-    let raw = match std::env::var(name) {
-        Ok(v) => v,
-        Err(_) => return default,
-    };
-    let parsed = raw.parse::<u64>().ok().unwrap_or(default);
-    parsed.clamp(min, max)
+fn env_u64(names: &[&str], default: u64, min: u64, max: u64) -> u64 {
+    for name in names {
+        if let Ok(v) = std::env::var(name) {
+            if let Ok(parsed) = v.trim().parse::<u64>() {
+                return parsed.clamp(min, max);
+            }
+        }
+    }
+    default
 }
 
 fn consistency_watcher_wait_steps() -> u32 {
     static STEPS: OnceLock<u32> = OnceLock::new();
     *STEPS.get_or_init(|| {
         env_u32(
-            "LDB_CONSISTENCY_WATCHER_WAIT_STEPS",
+            &["JETCACHE_CONSISTENCY_WATCHER_WAIT_STEPS", "CACHE_CONSISTENCY_WATCHER_WAIT_STEPS", "LDB_CONSISTENCY_WATCHER_WAIT_STEPS"],
             DEFAULT_CONSISTENCY_WATCHER_WAIT_STEPS,
             0,
             60,
@@ -129,7 +132,7 @@ fn consistency_watcher_wait_step_secs() -> u64 {
     static SECS: OnceLock<u64> = OnceLock::new();
     *SECS.get_or_init(|| {
         env_u64(
-            "LDB_CONSISTENCY_WATCHER_WAIT_STEP_SECS",
+            &["JETCACHE_CONSISTENCY_WATCHER_WAIT_STEP_SECS", "CACHE_CONSISTENCY_WATCHER_WAIT_STEP_SECS", "LDB_CONSISTENCY_WATCHER_WAIT_STEP_SECS"],
             DEFAULT_CONSISTENCY_WATCHER_WAIT_STEP_SECS,
             0,
             30,
@@ -144,6 +147,7 @@ pub struct Config {
     /// NATS subject prefix for this instance (matches `LDB_INSTANCE`).
     pub instance: String,
     /// NATS KV bucket and WAL prefix (matches `LDB_DATA_INSTANCE`).
+    #[allow(dead_code)]
     pub data_instance: String,
 }
 
@@ -222,54 +226,39 @@ struct TableReq {
     table: String,
 }
 
+fn deserialize_cursor<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match opt {
+        None => Ok(None),
+        Some(serde_json::Value::Number(n)) => Ok(n.as_u64()),
+        Some(serde_json::Value::String(s)) => {
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                s.parse::<u64>().map(Some).map_err(D::Error::custom)
+            }
+        }
+        _ => Err(D::Error::custom("invalid cursor format")),
+    }
+}
+
 #[derive(Deserialize)]
 struct KeysReq {
     table: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_cursor")]
     cursor: Option<u64>,
     #[serde(default)]
     consistency: Option<ConsistencyReq>,
 }
 
 #[derive(Deserialize)]
-struct FieldReq {
+struct PrefixReq {
     table: String,
-    field: String,
-}
-
-#[derive(Deserialize)]
-struct ScanReq {
-    table: String,
-    #[serde(default)]
-    filters: Vec<FieldFilter>,
-    #[serde(default)]
-    order_by: Option<SortByReq>,
-    #[serde(default)]
-    limit: Option<u32>,
-    #[serde(default)]
-    offset: Option<u32>,
-    #[serde(default)]
-    key_prefix: Option<String>,
-    #[serde(default)]
-    consistency: Option<ConsistencyReq>,
-}
-
-#[derive(Deserialize)]
-struct SortByReq {
-    field: String,
-    #[serde(default = "default_asc")]
-    order: String,
-}
-
-fn default_asc() -> String {
-    "asc".to_string()
-}
-
-#[derive(Deserialize)]
-struct CountReq {
-    table: String,
-    #[serde(default)]
-    filters: Vec<FieldFilter>,
+    prefix: String,
     #[serde(default)]
     consistency: Option<ConsistencyReq>,
 }
@@ -297,60 +286,9 @@ struct BatchPutReq {
 }
 
 #[derive(Deserialize)]
-struct AggregateReq {
-    table: String,
-    #[serde(default)]
-    filters: Vec<FieldFilter>,
-    #[serde(default)]
-    group_by: Option<String>,
-    ops: Vec<AggOpReq>,
-    #[serde(default)]
-    consistency: Option<ConsistencyReq>,
-}
-
-#[derive(Deserialize)]
-struct AggOpReq {
-    #[serde(rename = "fn")]
-    fn_name: String,
-    #[serde(default)]
-    field: Option<String>,
-}
-
-#[derive(Deserialize)]
 struct SchemaSetReq {
     table: String,
     schema: serde_json::Value,
-}
-
-#[derive(Deserialize)]
-struct SchedulePutReq {
-    table: String,
-    key: String,
-    value: String, // base64
-    /// RFC 3339 UTC timestamp at which the write should fire.
-    at: String,
-    #[serde(default)]
-    ttl_seconds: Option<u64>,
-}
-
-/// Body stored in the schedule message and re-delivered to the fire subject.
-#[derive(Serialize, Deserialize)]
-struct ScheduleFireBody {
-    /// base64-encoded value to write.
-    v: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ttl: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct IndexCreateReq {
-    table: String,
-    /// Single field index.
-    #[serde(default)]
-    field: Option<String>,
-    /// Compound index (multiple fields).
-    #[serde(default)]
-    fields: Option<Vec<String>>,
 }
 
 // ── Response types ─────────────────────────────────────────────────
@@ -389,24 +327,23 @@ struct KeysResp {
     keys: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cursor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
 }
 
 #[derive(Serialize)]
-struct ScanResp {
-    rows: Vec<RowResp>,
-    total_count: u64,
+struct PrefixRow {
+    key: String,
+    value: String, // base64
+    revision: u64,
 }
 
 #[derive(Serialize)]
-struct CountResp {
-    count: u64,
+struct PrefixResp {
+    rows: Vec<PrefixRow>,
 }
 
-#[derive(Serialize)]
-struct IndexesResp {
-    indexes: Vec<String>,
-}
-
+#[allow(dead_code)]
 #[derive(Serialize)]
 struct ErrorResp {
     error: String,
@@ -445,11 +382,6 @@ struct BatchPutResp {
 }
 
 #[derive(Serialize)]
-struct AggregateResp {
-    groups: Vec<state::AggGroup>,
-}
-
-#[derive(Serialize)]
 struct SchemaResp {
     schema: serde_json::Value,
 }
@@ -470,7 +402,7 @@ struct ChangeEvent {
 /// Unified operation dispatcher.
 pub async fn dispatch_operation(
     client: &Client,
-    js: &JetStream,
+    _js: &JetStream,
     config: &SharedConfig,
     state: &SharedState,
     store: &SharedStore,
@@ -501,21 +433,12 @@ pub async fn dispatch_operation(
         "create" => handle_create(client, state, store, payload, instance).await,
         "exists" => handle_exists(state, store, payload).await,
         "keys" => handle_keys(state, store, payload).await,
-        "scan" => handle_scan(state, store, payload).await,
-        "count" => handle_count(state, store, payload).await,
-        "index.create" | "index_create" => handle_index_create(state, store, payload).await,
-        "index.drop" | "index_drop" => handle_index_drop(state, store, payload).await,
-        "index.list" | "index_list" => handle_index_list(state, payload),
-        "txn" => handle_txn(js, state, store, payload, config.data_instance.as_str()).await,
+        "prefix" => handle_prefix(state, store, payload).await,
         "batch.get" | "batch_get" => handle_batch_get(state, store, payload).await,
         "batch.put" | "batch_put" => handle_batch_put(client, state, store, payload, instance).await,
-        "aggregate" => handle_aggregate(state, store, payload).await,
         "schema.set" | "schema_set" => handle_schema_set(state, store, payload).await,
         "schema.get" | "schema_get" => handle_schema_get(state, payload),
         "schema.delete" | "schema_delete" => handle_schema_delete(state, store, payload).await,
-        "schedule_put" => {
-            handle_schedule_put(js, state, store, payload, config.data_instance.as_str()).await
-        }
         _ => Err(format!("unknown operation: {op}")),
     };
 
@@ -544,6 +467,7 @@ pub async fn handle_service_request(
 }
 
 /// Handle an incoming raw request message (fallback/legacy).
+#[allow(dead_code)]
 pub async fn handle(
     client: &Client,
     js: &JetStream,
@@ -737,27 +661,7 @@ async fn reload_table_from_kv(
 
     let mut s = state.borrow_mut();
     let ts = s.table(table);
-    let existing_index_fields: Vec<String> = ts.indexes.keys().cloned().collect();
-    let existing_compound_defs: Vec<(String, Vec<String>)> = ts
-        .compound_indexes
-        .iter()
-        .map(|(name, idx)| (name.clone(), idx.fields.clone()))
-        .collect();
     ts.data.clear();
-    ts.indexes.clear();
-    for field in existing_index_fields {
-        ts.indexes.insert(field, std::collections::BTreeMap::new());
-    }
-    ts.compound_indexes.clear();
-    for (name, fields) in existing_compound_defs {
-        ts.compound_indexes.insert(
-            name,
-            state::CompoundIndex {
-                fields,
-                data: std::collections::BTreeMap::new(),
-            },
-        );
-    }
     let encrypted = ts.encrypted;
     for (key, value, revision) in entries {
         let plaintext = match maybe_decrypt(table, &key, value, encrypted) {
@@ -1358,221 +1262,37 @@ pub(crate) async fn handle_keys(
     ok_json(&KeysResp {
         keys: page,
         cursor: next_cursor,
+        next_cursor: next_cursor.map(|c| c.to_string()),
     })
 }
 
-pub(crate) async fn handle_scan(
+pub(crate) async fn handle_prefix(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let req: ScanReq = parse_req(payload)?;
+    let req: PrefixReq = parse_req(payload)?;
     ensure_min_revision(&req.table, &req.consistency, state, store).await?;
-
-    let s = state.borrow();
-    let table = s.tables.get(&req.table);
-    let Some(table) = table else {
-        return ok_json(&ScanResp {
-            rows: vec![],
-            total_count: 0,
-        });
-    };
-
-    // Try index scan, fall back to full scan.
-    let matching_keys = match state::index_scan(table, &req.filters) {
-        Some(keys) => keys,
-        None => table
-            .data
-            .iter()
-            .filter(|(k, row)| {
-                req.key_prefix
-                    .as_ref()
-                    .map_or(true, |pfx| k.starts_with(pfx.as_str()))
-                    && state::matches_filters(&row.value, &req.filters)
-            })
-            .map(|(k, _)| k.clone())
-            .collect(),
-    };
-
-    // Post-filter by key_prefix for index-scanned keys.
-    let matching_keys: Vec<String> = matching_keys
-        .into_iter()
-        .filter(|k| {
-            req.key_prefix
-                .as_ref()
-                .map_or(true, |pfx| k.starts_with(pfx.as_str()))
-                && table.data.contains_key(k.as_str())
-        })
-        .collect();
-
-    let total_count = matching_keys.len() as u64;
-
-    // Sort if requested.
-    let mut sorted_keys = matching_keys;
-    if let Some(ref order_by) = req.order_by {
-        sorted_keys.sort_by(|a, b| {
-            let va = table
-                .data
-                .get(a)
-                .and_then(|r| state::extract_json_field(&r.value, &order_by.field));
-            let vb = table
-                .data
-                .get(b)
-                .and_then(|r| state::extract_json_field(&r.value, &order_by.field));
-            let cmp = va.as_deref().cmp(&vb.as_deref());
-            if order_by.order == "desc" {
-                cmp.reverse()
-            } else {
-                cmp
-            }
-        });
-    }
-
-    // Paginate.
-    let offset = req.offset.unwrap_or(0) as usize;
-    let limit = req.limit.unwrap_or(100) as usize;
-    let page: Vec<RowResp> = sorted_keys
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .filter_map(|k| {
-            let row = table.data.get(&k)?;
-            Some(RowResp {
-                key: k,
-                value: B64.encode(&row.value),
-                revision: row.revision,
-                session: None,
-            })
-        })
-        .collect();
-
-    ok_json(&ScanResp {
-        rows: page,
-        total_count,
-    })
-}
-
-pub(crate) async fn handle_count(
-    state: &SharedState,
-    store: &SharedStore,
-    payload: &[u8],
-) -> Result<Vec<u8>, String> {
-    let req: CountReq = parse_req(payload)?;
-    ensure_min_revision(&req.table, &req.consistency, state, store).await?;
-
-    let s = state.borrow();
-    let table = s.tables.get(&req.table);
-    let count = match table {
-        None => 0,
-        Some(table) => match state::index_scan(table, &req.filters) {
-            Some(keys) => keys
-                .iter()
-                .filter(|k| table.data.contains_key(k.as_str()))
-                .count() as u64,
-            None => table
-                .data
-                .values()
-                .filter(|row| state::matches_filters(&row.value, &req.filters))
-                .count() as u64,
-        },
-    };
-
-    ok_json(&CountResp { count })
-}
-
-pub(crate) async fn handle_index_create(
-    state: &SharedState,
-    store: &SharedStore,
-    payload: &[u8],
-) -> Result<Vec<u8>, String> {
-    let req: IndexCreateReq = parse_req(payload)?;
     ensure_loaded(&req.table, state, store).await?;
 
-    let index_name = if let Some(fields) = &req.fields {
-        if fields.len() < 2 {
-            return Err("compound index requires at least 2 fields".into());
-        }
-        state
-            .borrow_mut()
-            .table(&req.table)
-            .create_compound_index(fields);
-        fields.join("+")
-    } else if let Some(ref field) = req.field {
-        state.borrow_mut().table(&req.table).create_index(field);
-        field.clone()
-    } else {
-        return Err("either 'field' or 'fields' is required".into());
-    };
-
-    // Persist index definition to _indexes bucket.
-    let kv = crate::store::get_or_create_kv(store, "_indexes")
-        .await
-        .map_err(|e| format!("{e}"))?;
-    let index_key = format!("{}.{}", req.table, index_name);
-    let fields_list = if let Some(fields) = &req.fields {
-        fields.clone()
-    } else if let Some(field) = &req.field {
-        vec![field.clone()]
-    } else {
-        return Err("no fields for index".into());
-    };
-    let index_def = serde_json::json!({
-        "table": req.table,
-        "name": index_name,
-        "fields": fields_list,
-    });
-    let index_bytes = serde_json::to_vec(&index_def).map_err(|e| format!("{e}"))?;
-    kv.put(&index_key, &index_bytes)
-        .await
-        .map_err(|e| format!("{e}"))?;
-
-    ok_json(&EmptyResp {})
-}
-
-pub(crate) async fn handle_index_drop(
-    state: &SharedState,
-    store: &SharedStore,
-    payload: &[u8],
-) -> Result<Vec<u8>, String> {
-    let req: FieldReq = parse_req(payload)?;
-    let mut s = state.borrow_mut();
-    let t = s.table(&req.table);
-    t.drop_index(&req.field);
-    t.drop_compound_index(&req.field);
-    drop(s); // explicitly drop to release borrow
-
-    // Delete from _indexes bucket.
-    let kv = crate::store::get_or_create_kv(store, "_indexes")
-        .await
-        .map_err(|e| format!("{e}"))?;
-    let index_key = format!("{}.{}", req.table, req.field);
-    let _ = kv.delete(&index_key).await;
-
-    ok_json(&EmptyResp {})
-}
-
-pub(crate) fn handle_index_list(state: &SharedState, payload: &[u8]) -> Result<Vec<u8>, String> {
-    let req: TableReq = parse_req(payload)?;
     let s = state.borrow();
-    let mut indexes: Vec<String> = s.tables.get(&req.table).map_or_else(Vec::new, |t| {
-        let mut v: Vec<String> = t.indexes.keys().cloned().collect();
-        v.extend(t.compound_indexes.keys().cloned());
-        v
-    });
-    indexes.sort();
-    ok_json(&IndexesResp { indexes })
-}
+    let table = s.tables.get(&req.table);
+    let mut rows: Vec<PrefixRow> = match table {
+        Some(t) => t
+            .data
+            .iter()
+            .filter(|(k, _)| k.starts_with(&req.prefix))
+            .map(|(k, row)| PrefixRow {
+                key: k.clone(),
+                value: B64.encode(&row.value),
+                revision: row.revision,
+            })
+            .collect(),
+        None => vec![],
+    };
+    rows.sort_by(|a, b| a.key.cmp(&b.key));
 
-pub(crate) async fn handle_txn(
-    js: &JetStream,
-    state: &SharedState,
-    store: &SharedStore,
-    payload: &[u8],
-    instance: &str,
-) -> Result<Vec<u8>, String> {
-    let req: txn::TxnRequest = parse_req(payload)?;
-    let resp = txn::execute(js, state, store, req, instance).await?;
-    ok_json(&resp)
+    ok_json(&PrefixResp { rows })
 }
 
 // ── Batch operations ───────────────────────────────────────────────
@@ -1685,34 +1405,7 @@ pub(crate) async fn handle_batch_put(
     })
 }
 
-// ── Aggregation ────────────────────────────────────────────────────
 
-pub(crate) async fn handle_aggregate(
-    state: &SharedState,
-    store: &SharedStore,
-    payload: &[u8],
-) -> Result<Vec<u8>, String> {
-    let req: AggregateReq = parse_req(payload)?;
-    ensure_min_revision(&req.table, &req.consistency, state, store).await?;
-
-    let ops: Vec<state::AggOp> = req
-        .ops
-        .iter()
-        .map(|o| state::AggOp {
-            fn_name: o.fn_name.clone(),
-            field: o.field.clone(),
-        })
-        .collect();
-
-    let s = state.borrow();
-    let table = s.tables.get(&req.table);
-    let Some(table) = table else {
-        return ok_json(&AggregateResp { groups: vec![] });
-    };
-
-    let groups = state::aggregate(table, &req.filters, req.group_by.as_deref(), &ops);
-    ok_json(&AggregateResp { groups })
-}
 
 // ── Schema management ──────────────────────────────────────────────
 
@@ -1755,157 +1448,6 @@ pub(crate) fn handle_schema_get(state: &SharedState, payload: &[u8]) -> Result<V
     ok_json(&SchemaResp { schema })
 }
 
-/// Registers a one-shot delayed write via NATS 2.14+ message scheduling (ADR-51).
-///
-/// Validates the request, encodes the value into the schedule body, and
-/// publishes a schedule message. The NATS server fires the body to the
-/// fire subject when `at` arrives; `handle_schedule_fire` performs the KV put.
-pub(crate) async fn handle_schedule_put(
-    js: &JetStream,
-    state: &SharedState,
-    store: &SharedStore,
-    payload: &[u8],
-    data_instance: &str,
-) -> Result<Vec<u8>, String> {
-    let req: SchedulePutReq = parse_req(payload)?;
-    let value = B64.decode(&req.value).map_err(|e| format!("base64: {e}"))?;
-    validate_write_bounds(&req.table, &req.key, &value)?;
-
-    // Validate the `at` timestamp is at least superficially RFC 3339-shaped.
-    // The NATS server validates the full semantics.
-    if req.at.len() < 10 || !req.at.starts_with(|c: char| c.is_ascii_digit()) {
-        return Err("at must be an RFC 3339 timestamp (e.g. 2026-06-01T09:00:00Z)".into());
-    }
-
-    // Schema validation against in-memory schema (if any).
-    {
-        let s = state.borrow();
-        if let Some(schema) = s.tables.get(&req.table).and_then(|t| t.schema.as_ref()) {
-            state::validate_schema(&value, schema)?;
-        }
-    }
-
-    // Ensure the table's KV bucket exists so the fire handler can write to it.
-    let _ = crate::store::get_or_create_kv(store, &req.table)
-        .await
-        .map_err(|e| format!("{e}"))?;
-
-    let fire_body = ScheduleFireBody {
-        v: req.value.clone(),
-        ttl: req.ttl_seconds,
-    };
-    let body = serde_json::to_vec(&fire_body).map_err(|e| format!("serialize: {e}"))?;
-
-    crate::schedule::publish_schedule_at(js, data_instance, &req.table, &req.key, &body, &req.at)
-        .await
-        .map_err(|e| format!("{e}"))?;
-
-    ok_json(&EmptyResp {})
-}
-
-/// Called when NATS fires a scheduled write to `{data_instance}-sched-fire.{table}.{key}`.
-///
-/// Extracts table and key from the subject, decodes the fire body, and
-/// performs the KV put. Also publishes the standard change event.
-pub(crate) async fn handle_schedule_fire(
-    client: &Client,
-    store: &SharedStore,
-    state: &SharedState,
-    subject: &str,
-    payload: &[u8],
-    instance: &str,
-) {
-    // Subject format: `{data_instance}-sched-fire.{table}.{key}`.
-    // Find the first '.' after the prefix to extract table and key.
-    let fire_part = match subject.find("-sched-fire.") {
-        Some(idx) => &subject[idx + "-sched-fire.".len()..],
-        None => {
-            eprintln!("lattice-db: schedule fire: unrecognised subject {subject}");
-            return;
-        }
-    };
-    let (table, key) = match fire_part.split_once('.') {
-        Some(pair) => pair,
-        None => {
-            eprintln!("lattice-db: schedule fire: missing key in subject {subject}");
-            return;
-        }
-    };
-
-    // S-01: reject reserved tables.
-    if is_reserved_table(table) {
-        eprintln!("lattice-db: schedule fire: rejected write targeting reserved table {table}");
-        return;
-    }
-
-    let fire_body: ScheduleFireBody = match serde_json::from_slice(payload) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("lattice-db: schedule fire: bad body on {subject}: {e}");
-            return;
-        }
-    };
-
-    let value = match B64.decode(&fire_body.v) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("lattice-db: schedule fire: base64 decode error on {subject}: {e}");
-            return;
-        }
-    };
-
-    // S-04: validate write bounds before writing.
-    if let Err(e) = validate_write_bounds(table, key, &value) {
-        eprintln!("lattice-db: schedule fire: bounds validation failed for {table}/{key}: {e}");
-        return;
-    }
-
-    // Validate schema if defined for this table.
-    if let Some(schema) = state
-        .borrow()
-        .tables
-        .get(table)
-        .and_then(|t| t.schema.as_ref())
-    {
-        if let Err(e) = crate::state::validate_schema(&value, schema) {
-            eprintln!("lattice-db: schedule fire: schema validation failed for {table}/{key}: {e}");
-            return;
-        }
-    }
-
-    let kv = match crate::store::get_or_create_kv(store, table).await {
-        Ok(kv) => kv,
-        Err(e) => {
-            eprintln!("lattice-db: schedule fire: kv error for table {table}: {e}");
-            return;
-        }
-    };
-
-    let encrypted = state.borrow().is_encrypted(table);
-    let store_bytes = maybe_encrypt(table, key, &value, encrypted);
-    let result = match fire_body.ttl {
-        Some(ttl) => kv.put_with_ttl(key, &store_bytes, secs(ttl)).await,
-        None => kv.put(key, &store_bytes).await,
-    };
-
-    match result {
-        Ok(revision) => {
-            state.borrow_mut().table(table).upsert(key, value, revision);
-            publish_change(
-                client,
-                "put",
-                table,
-                key,
-                if encrypted { None } else { Some(&fire_body.v) },
-                Some(revision),
-                instance,
-            );
-        }
-        Err(e) => {
-            eprintln!("lattice-db: schedule fire: kv put failed for {table}/{key}: {e}");
-        }
-    }
-}
 
 pub(crate) async fn handle_schema_delete(
     state: &SharedState,
@@ -1967,21 +1509,11 @@ pub(crate) fn is_reserved_table(table: &str) -> bool {
 ///
 /// Checked against the raw user-supplied payload, before any partition prefix
 /// transformation, so `_indexes` and `_schemas` are always blocked.
-pub(crate) fn check_no_reserved_tables(op: &str, payload: &[u8]) -> Result<(), String> {
+pub(crate) fn check_no_reserved_tables(_op: &str, payload: &[u8]) -> Result<(), String> {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) else {
         return Ok(()); // malformed JSON is caught later by parse_req
     };
-    if op == "txn" {
-        if let Some(ops) = v.get("ops").and_then(|o| o.as_array()) {
-            for entry in ops {
-                if let Some(table) = entry.get("table").and_then(|t| t.as_str()) {
-                    if is_reserved_table(table) {
-                        return Err(format!("table name '{table}' is reserved"));
-                    }
-                }
-            }
-        }
-    } else if let Some(table) = v.get("table").and_then(|t| t.as_str()) {
+    if let Some(table) = v.get("table").and_then(|t| t.as_str()) {
         if is_reserved_table(table) {
             return Err(format!("table name '{table}' is reserved"));
         }

@@ -5,12 +5,10 @@
 
 mod handler;
 mod log;
-mod schedule;
 mod state;
 mod store;
 mod tcp_server;
 mod tests;
-mod txn;
 pub mod vault;
 
 use nats_wasi::client::{Client, ConnectConfig};
@@ -33,32 +31,7 @@ impl wasip3::exports::cli::run::Guest for Component {
     }
 }
 
-pub(crate) async fn dispatch_request(payload: &[u8]) -> Vec<u8> {
-    let (client, js, config, state, store) = get_shared();
-    let (_status, body) = tcp_server::dispatch(&client, &js, &config, &state, &store, payload).await;
-    body
-}
 
-static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-static mut SHARED_CTX: Option<(Client, JetStream, handler::SharedConfig, state::SharedState, store::SharedStore)> = None;
-
-fn get_shared() -> (Client, JetStream, handler::SharedConfig, state::SharedState, store::SharedStore) {
-    unsafe {
-        let (c, j, cfg, st, str) = SHARED_CTX.as_ref().expect("storage-service context not initialized");
-        (c.clone(), j.clone(), cfg.clone(), st.clone(), str.clone())
-    }
-}
-
-async fn ensure_initialized() {
-    if INIT.get().is_some() {
-        return;
-    }
-    if let Err(e) = init_service().await {
-        eprintln!("storage-service init failed: {e}");
-    } else {
-        let _ = INIT.set(());
-    }
-}
 
 fn get_env_opt(keys: &[&str]) -> Option<String> {
     for k in keys {
@@ -109,59 +82,21 @@ fn build_connect_config(address: String, name: &str, use_tls: bool, is_data: boo
     }
 }
 
-async fn init_service() -> Result<(), Box<dyn std::error::Error>> {
-    let nats_data_url = std::env::var("NATS_DATA_URL")
-        .ok()
-        .or_else(|| std::env::var("NATS_URL").ok())
-        .or_else(|| std::env::args().nth(1))
-        .unwrap_or_else(|| "10.68.11.163:4222".to_string());
-
-    let use_tls = std::env::var("NATS_TLS").map_or(false, |v| v == "1" || v == "true");
-
-    let data_client = Client::connect(build_connect_config(
-        nats_data_url.to_string(),
-        "lattice-db-host",
-        use_tls,
-        true,
-    ))
-    .await?;
-
-    let instance = std::env::var("LDB_INSTANCE").unwrap_or_else(|_| "lid".to_string());
-    let data_instance = std::env::var("LDB_DATA_INSTANCE").unwrap_or_else(|_| instance.clone());
-
-    let shared_state = state::new_shared_state();
-    let shared_store = store::new_shared_store(data_client.clone(), data_instance.clone());
-    let js = JetStream::new(data_client.clone());
-
-    let auth_token = std::env::var("LDB_AUTH_TOKEN").ok();
-    let config: handler::SharedConfig = Rc::new(handler::Config {
-        auth_token,
-        instance,
-        data_instance,
-    });
-
-    unsafe {
-        SHARED_CTX = Some((data_client, js, config, shared_state, shared_store));
-    }
-    Ok(())
-}
 
 async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     // Determine which transport modes are enabled.
-    let nats_url = std::env::var("NATS_URL")
-        .ok()
+    let nats_url = get_env_opt(&["JETCACHE_NATS_URL", "CACHE_NATS_URL", "NATS_URL"])
         .or_else(|| std::env::args().nth(1));
-    let nats_data_url = std::env::var("NATS_DATA_URL").ok();
+    let nats_data_url = get_env_opt(&["JETCACHE_DATA_URL", "CACHE_DATA_URL", "NATS_DATA_URL"]);
     let tcp_port = Some(
-        std::env::var("LDB_TCP_PORT")
-            .ok()
+        get_env_opt(&["JETCACHE_TCP_PORT", "CACHE_TCP_PORT", "LDB_TCP_PORT", "JETCACHE_PORT", "CACHE_PORT", "TCP_PORT"])
             .and_then(|v| v.parse::<u16>().ok())
             .unwrap_or(4080),
     );
 
     // At least one of NATS messaging or TCP must be enabled.
     if nats_url.is_none() && tcp_port.is_none() {
-        return Err("at least one of NATS_URL or LDB_TCP_PORT must be set".into());
+        return Err("at least one of NATS_URL or JETCACHE_TCP_PORT/CACHE_TCP_PORT/LDB_TCP_PORT must be set".into());
     }
 
     // Data connection (JetStream KV) — required for persistence.
@@ -173,17 +108,17 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     // TLS: enabled if NATS_TLS=1 is set.
     // Note: wasip3 uses host-side TLS via wasi:tls — no in-wasm crypto.
     // Custom CA certs are not yet supported by wasi:tls hosts.
-    let use_tls = std::env::var("NATS_TLS").map_or(false, |v| v == "1" || v == "true");
+    let use_tls = get_env_opt(&["JETCACHE_TLS", "CACHE_TLS", "NATS_TLS"]).map_or(false, |v| v == "1" || v == "true");
 
     if use_tls {
         log_info!("TLS enabled (host-side wasi:tls)");
     }
 
     // Connect to NATS for data (always needed for JetStream KV).
-    eprintln!("lattice-db: connecting to NATS (data) at {nats_data_addr}");
+    eprintln!("jetcache: connecting to NATS (data) at {nats_data_addr}");
     let data_client = Client::connect(build_connect_config(
         nats_data_addr.to_string(),
-        "lattice-db-data",
+        "jetcache-data",
         use_tls,
         true,
     ))
@@ -192,14 +127,14 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     // Connect to NATS for messaging (req/reply) — only if NATS_URL is set.
     let msg_client = if let Some(ref nats_msg_addr) = nats_url {
         if *nats_msg_addr == nats_data_addr {
-            eprintln!("lattice-db: NATS messaging using same connection as data");
+            eprintln!("jetcache: NATS messaging using same connection as data");
             Some(data_client.clone())
         } else {
-            eprintln!("lattice-db: connecting to NATS (messaging) at {nats_msg_addr}");
+            eprintln!("jetcache: connecting to NATS (messaging) at {nats_msg_addr}");
             Some(
                 Client::connect(build_connect_config(
                     nats_msg_addr.to_string(),
-                    "lattice-db-msg",
+                    "jetcache-msg",
                     use_tls,
                     false,
                 ))
@@ -207,26 +142,26 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             )
         }
     } else {
-        eprintln!("lattice-db: NATS messaging disabled (no NATS_URL)");
+        eprintln!("jetcache: NATS messaging disabled (no NATS_URL)");
         None
     };
 
     eprintln!(
-        "lattice-db: connected to data={}",
+        "jetcache: connected to data={}",
         data_client.server_info().server_name,
     );
 
     // Instance names: drive NATS subject and KV bucket prefixes.
     let instance = {
-        let raw = std::env::var("LDB_INSTANCE").unwrap_or_else(|_| "ldb".to_string());
-        validate_instance_name("LDB_INSTANCE", &raw)?;
-        eprintln!("lattice-db: instance (messaging) = {raw}");
+        let raw = get_env_opt(&["JETCACHE_INSTANCE", "CACHE_INSTANCE", "LDB_INSTANCE"]).unwrap_or_else(|| "lid".to_string());
+        validate_instance_name("JETCACHE_INSTANCE", &raw)?;
+        eprintln!("jetcache: instance (messaging) = {raw}");
         raw
     };
     let data_instance = {
-        let raw = std::env::var("LDB_DATA_INSTANCE").unwrap_or_else(|_| instance.clone());
-        validate_instance_name("LDB_DATA_INSTANCE", &raw)?;
-        eprintln!("lattice-db: instance (data) = {raw}");
+        let raw = get_env_opt(&["JETCACHE_DATA_INSTANCE", "CACHE_DATA_INSTANCE", "LDB_DATA_INSTANCE"]).unwrap_or_else(|| instance.clone());
+        validate_instance_name("JETCACHE_DATA_INSTANCE", &raw)?;
+        eprintln!("jetcache: instance (data) = {raw}");
         raw
     };
 
@@ -235,9 +170,9 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     let js = JetStream::new(data_client.clone());
 
     // Auth config.
-    let auth_token = std::env::var("LDB_AUTH_TOKEN").ok();
+    let auth_token = get_env_opt(&["JETCACHE_AUTH_TOKEN", "CACHE_AUTH_TOKEN", "LDB_AUTH_TOKEN"]);
     if auth_token.is_some() {
-        eprintln!("lattice-db: auth token required (_auth field)");
+        eprintln!("jetcache: auth token required (_auth field)");
     }
 
     // Data epoch: a random identifier stored in `_meta` KV. Each replica
@@ -250,7 +185,7 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         let bytes = wasip3::random::random::get_random_bytes(8);
         let epoch: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let _ = meta_kv.put("epoch", epoch.as_bytes()).await;
-        eprintln!("lattice-db: data epoch (written) = {epoch}");
+        eprintln!("jetcache: data epoch (written) = {epoch}");
         handler::set_data_epoch(epoch);
     }
     // Watch `_meta` epoch key so all replicas converge when any peer starts.
@@ -314,21 +249,6 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Set up WAL stream and recover incomplete transactions.
-    txn::init_node_id();
-    txn::ensure_wal_stream(&js, &data_instance)
-        .await
-        .map_err(|e| format!("wal stream setup: {e}"))?;
-
-    // Set up schedules stream (NATS 2.14+ ADR-51 message scheduling).
-    schedule::ensure_schedule_stream(&js, &data_instance)
-        .await
-        .map_err(|e| format!("schedule stream setup: {e}"))?;
-
-    let recovered = txn::recover(&js, &shared_state, &shared_store, &data_instance).await?;
-    if recovered > 0 {
-        eprintln!("lattice-db: recovered {recovered} incomplete transaction(s)");
-    }
 
     // Load persisted schemas from KV.
     {
@@ -350,7 +270,7 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
                         ts.schema = Some(schema);
                         ts.encrypted = enc;
                         eprintln!(
-                            "lattice-db: loaded schema for table {} (encrypted={enc})",
+                            "jetcache: loaded schema for table {} (encrypted={enc})",
                             entry.key
                         );
                     }
@@ -372,19 +292,19 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
                     let watcher = match watcher_res {
                         Ok(w) => w,
                         Err(e) => {
-                            eprintln!("lattice-db: schema watcher setup failed: {e} — retrying");
+                            eprintln!("jetcache: schema watcher setup failed: {e} — retrying");
                             wasip3::clocks::monotonic_clock::wait_for(nats_wasi::client::secs(5))
                                 .await;
                             continue;
                         }
                     };
-                    eprintln!("lattice-db: schema watcher started (after seq {since})");
+                    eprintln!("jetcache: schema watcher started (after seq {since})");
                     loop {
                         let entry = match watcher.next().await {
                             Ok(e) => e,
                             Err(e) => {
                                 eprintln!(
-                                    "lattice-db: schema watcher disconnected: {e} — reconnecting"
+                                    "jetcache: schema watcher disconnected: {e} — reconnecting"
                                 );
                                 break;
                             }
@@ -405,7 +325,7 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
                                     ts.schema = Some(schema);
                                     ts.encrypted = enc;
                                     eprintln!(
-                                        "lattice-db: schema updated for {table_name} (rev {}, encrypted={enc})",
+                                        "jetcache: schema updated for {table_name} (rev {}, encrypted={enc})",
                                         entry.revision
                                     );
                                 }
@@ -415,7 +335,7 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
                                 let ts = s.table(&table_name);
                                 ts.schema = None;
                                 ts.encrypted = false;
-                                eprintln!("lattice-db: schema removed for {table_name}");
+                                eprintln!("jetcache: schema removed for {table_name}");
                             }
                         }
                     }
@@ -424,175 +344,11 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Load persisted index definitions from KV and rebuild in-memory indexes.
-    // Without this, indexes are silently lost on reboot and never propagate
-    // to newly scaled-up replicas.
-    {
-        let index_kv = store::get_or_create_kv(&shared_store, "_indexes").await;
-        if let Ok(kv) = index_kv {
-            let mut last_seq = 0u64;
-            if let Ok(status) = kv.status().await {
-                last_seq = status.last_seq;
-            }
-            if let Ok(entries) = kv.load_all().await {
-                let mut s = shared_state.borrow_mut();
-                for entry in &entries {
-                    let Ok(def) = serde_json::from_slice::<serde_json::Value>(&entry.value) else {
-                        continue;
-                    };
-                    let Some(table) = def.get("table").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    let fields: Vec<String> = def
-                        .get("fields")
-                        .and_then(|v| v.as_array())
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if fields.is_empty() {
-                        continue;
-                    }
-                    let ts = s.table(table);
-                    if fields.len() == 1 {
-                        ts.create_index(&fields[0]);
-                    } else {
-                        ts.create_compound_index(&fields);
-                    }
-                    eprintln!("lattice-db: loaded index for {table}: {}", fields.join("+"));
-                }
-            }
-            // Spawn index watcher for cross-replica sync. Reconnects
-            // automatically on disconnect so a NATS hiccup doesn't silently
-            // stop index propagation to newly scaled-up replicas.
-            let index_state = shared_state.clone();
-            let index_kv_handle = kv.clone();
-            wasip3::spawn(async move {
-                let mut since = last_seq;
-                loop {
-                    let watcher_res = if since == 0 {
-                        index_kv_handle.watch_all().await
-                    } else {
-                        index_kv_handle.watch_all_from_revision(since).await
-                    };
-                    let watcher = match watcher_res {
-                        Ok(w) => w,
-                        Err(e) => {
-                            eprintln!("lattice-db: index watcher setup failed: {e} — retrying");
-                            wasip3::clocks::monotonic_clock::wait_for(nats_wasi::client::secs(5))
-                                .await;
-                            continue;
-                        }
-                    };
-                    eprintln!("lattice-db: index watcher started (after seq {since})");
-                    loop {
-                        let entry = match watcher.next().await {
-                            Ok(e) => e,
-                            Err(e) => {
-                                eprintln!(
-                                    "lattice-db: index watcher disconnected: {e} — reconnecting"
-                                );
-                                break;
-                            }
-                        };
-                        since = entry.revision;
-                        match entry.operation {
-                            nats_wasi::kv::Operation::Put => {
-                                let Ok(def) =
-                                    serde_json::from_slice::<serde_json::Value>(&entry.value)
-                                else {
-                                    continue;
-                                };
-                                let Some(table) =
-                                    def.get("table").and_then(|v| v.as_str()).map(String::from)
-                                else {
-                                    continue;
-                                };
-                                let fields: Vec<String> = def
-                                    .get("fields")
-                                    .and_then(|v| v.as_array())
-                                    .map(|a| {
-                                        a.iter()
-                                            .filter_map(|v| v.as_str().map(String::from))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                if fields.is_empty() {
-                                    continue;
-                                }
-                                let mut s = index_state.borrow_mut();
-                                let ts = s.table(&table);
-                                if fields.len() == 1 {
-                                    ts.create_index(&fields[0]);
-                                } else {
-                                    ts.create_compound_index(&fields);
-                                }
-                                eprintln!(
-                                    "lattice-db: index updated for {table}: {} (rev {})",
-                                    fields.join("+"),
-                                    entry.revision
-                                );
-                            }
-                            _ => {
-                                // Key format: "{table}.{index_name}".
-                                if let Some((table, name)) = entry.key.split_once('.') {
-                                    let mut s = index_state.borrow_mut();
-                                    let ts = s.table(table);
-                                    ts.drop_index(name);
-                                    ts.drop_compound_index(name);
-                                    eprintln!("lattice-db: index removed for {table}: {name}");
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    }
-
-
-
-    // Subscribe to fired schedule deliveries (NATS 2.14+ ADR-51).
-    // The NATS server publishes here when a scheduled write's @at timestamp fires.
-    // We extract table/key from the subject and perform the KV put.
-    {
-        let fire_sub_subject = schedule::schedule_fire_wildcard(&data_instance);
-        let fire_sub = data_client.subscribe(&fire_sub_subject)?;
-        let fire_state = shared_state.clone();
-        let fire_store = shared_store.clone();
-        let fire_client = data_client.clone();
-        let fire_instance = instance.clone();
-        wasip3::spawn(async move {
-            loop {
-                let Ok(msg) = fire_sub.next().await else {
-                    break;
-                };
-                let fire_state = fire_state.clone();
-                let fire_store = fire_store.clone();
-                let fire_client = fire_client.clone();
-                let fire_instance = fire_instance.clone();
-                wasip3::spawn(async move {
-                    handler::handle_schedule_fire(
-                        &fire_client,
-                        &fire_store,
-                        &fire_state,
-                        &msg.subject,
-                        &msg.payload,
-                        &fire_instance,
-                    )
-                    .await;
-                });
-            }
-        });
-    }
-
-    // Subscribe to all lattice-db operations as an ADR-32 Microservice.
+    // Subscribe to all jetcache operations as an ADR-32 Microservice.
     if let Some(ref client) = msg_client {
         let queue_group = format!("{instance}-workers");
         let service_config = ServiceConfig::new(instance.clone(), env!("CARGO_PKG_VERSION"))
-            .description("NATS-native distributed database")
+            .description("In-memory read-through cache backed by NATS JetStream KV")
             .queue_group(&queue_group)
             .metadata("instance", &instance)
             .metadata("data_instance", &data_instance);
@@ -611,19 +367,12 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             "create",
             "exists",
             "keys",
-            "scan",
-            "count",
-            "index.create",
-            "index.drop",
-            "index.list",
-            "txn",
+            "prefix",
             "batch.get",
             "batch.put",
-            "aggregate",
             "schema.set",
             "schema.get",
             "schema.delete",
-            "schedule_put",
         ];
 
         for op in endpoints {
@@ -661,7 +410,7 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         eprintln!(
-            "lattice-db: ADR-32 microservice '{}' running (endpoints: {}, queue group: {queue_group})",
+            "jetcache: ADR-32 microservice '{}' running (endpoints: {}, queue group: {queue_group})",
             service.name(),
             endpoints.len()
         );

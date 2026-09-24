@@ -32,14 +32,19 @@ pub fn start(
     state: SharedState,
     store: SharedStore,
 ) {
-    let port = std::env::var("LDB_TCP_PORT")
+    let port = std::env::var("JETCACHE_TCP_PORT")
+        .or_else(|_| std::env::var("CACHE_TCP_PORT"))
+        .or_else(|_| std::env::var("LDB_TCP_PORT"))
+        .or_else(|_| std::env::var("JETCACHE_PORT"))
+        .or_else(|_| std::env::var("CACHE_PORT"))
+        .or_else(|_| std::env::var("TCP_PORT"))
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(DEFAULT_PORT);
 
     wasip3::spawn(async move {
         if let Err(e) = run_listener(port, client, js, config, state, store).await {
-            eprintln!("lattice-db: tcp listener fatal: {e}");
+            eprintln!("jetcache: tcp listener fatal: {e}");
         }
     });
 }
@@ -65,7 +70,7 @@ async fn run_listener(
         socket.listen().map_err(|e| format!("tcp listen: {e:?}"))?;
     std::mem::forget(socket);
 
-    eprintln!("lattice-db: tcp listening on 127.0.0.1:{port}");
+    eprintln!("jetcache: tcp listening on 127.0.0.1:{port}");
 
     loop {
         let read_buf = Vec::with_capacity(16);

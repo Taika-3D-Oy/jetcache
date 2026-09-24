@@ -6,7 +6,7 @@ on:
     tags: ["v*"]
 
 env:
-  OCI_IMAGE: ghcr.io/taika-3d-oy/lattice-db/storage-service
+  OCI_IMAGE: ghcr.io/taika-3d-oy/jetcache/storage-service
 
 jobs:
   build-and-push:

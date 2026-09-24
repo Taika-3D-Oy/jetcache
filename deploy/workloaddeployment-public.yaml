@@ -1,23 +1,23 @@
 apiVersion: runtime.wasmcloud.dev/v1alpha1
 kind: WorkloadDeployment
 metadata:
-  name: lattice-db
+  name: jetcache
   annotations:
-    description: lattice-db storage service (public registry example)
+    description: jetcache storage service (public registry example)
 spec:
   replicas: 1
   deployPolicy: RollingUpdate
   template:
     labels:
-      app.kubernetes.io/name: lattice-db
+      app.kubernetes.io/name: jetcache
       app.kubernetes.io/component: storage
     spec:
-      # NOTE: This service is built for wasm32-wasip3.
-      # Your wasmCloud host must run with wasip3 enabled (for example: wash host --wasip3).
+      # NOTE: This service is built for wasm32-wasip2.
+      # Your wasmCloud host must run with wasip2/3 enabled.
       components: []
       service:
         # Replace with your published OCI reference/tag.
-        image: ghcr.io/taika-3d-oy/lattice-db/storage-service:v0.3.0
+        image: ghcr.io/taika-3d-oy/jetcache/storage-service:v2.0.0-rc.1
         maxRestarts: 5
         localResources:
           environment:
@@ -26,10 +26,10 @@ spec:
               # If DNS is unavailable in your runtime/network stack, use a direct service IP.
               NATS_URL: "nats:4222"
               NATS_DATA_URL: "nats-data:4222"
-              LDB_INSTANCE: "ldb"
-              LDB_DATA_INSTANCE: "ldb-data"
-              LDB_CONSISTENCY_WATCHER_WAIT_STEPS: "2"
-              LDB_CONSISTENCY_WATCHER_WAIT_STEP_SECS: "1"
+              JETCACHE_INSTANCE: "lid"
+              JETCACHE_DATA_INSTANCE: "lid"
+              JETCACHE_CONSISTENCY_WATCHER_WAIT_STEPS: "2"
+              JETCACHE_CONSISTENCY_WATCHER_WAIT_STEP_SECS: "1"
       hostInterfaces:
         # Required so the service can open outgoing TCP connections to NATS.
         - namespace: wasi

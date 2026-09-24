@@ -1,8 +1,8 @@
-# lattice-db
+# jetcache (formerly lattice-db)
 
-A distributed database that lives entirely inside NATS.
+A lightweight in-memory read-through cache for wasmCloud backed by NATS JetStream KV.
 
-The engine is a `wasm32-wasip3` component that implements the official **NATS Microservices Framework (ADR-32)**. It connects to NATS, registers endpoints under its service group in a queue group, persists every table to its own JetStream KV bucket, and serves all CRUD, query, index, and transaction traffic over standardized NATS microservice request/reply.
+The engine is a `wasm32-wasip3` component that implements the official **NATS Microservices Framework (ADR-32)** and includes a high-performance local TCP listener. It connects to NATS, registers endpoints under its service group, persists every table to its own JetStream KV bucket, and serves low-latency key-value CRUD operations over standardized NATS microservice request/reply and local TCP.
 
 ```
 clients ──NATS ADR-32 req/rep──▶ storage-service (Wasm component)
@@ -10,104 +10,71 @@ clients ──NATS ADR-32 req/rep──▶ storage-service (Wasm component)
 co-located ──TCP :4080─────────▶       │
   components                           │
                                  NATS JetStream KV
-                                 (one bucket per table: ldb-{table})
+                                 (one bucket per table: {instance}-{table})
 ```
 
+- **In-Memory Cache with JetStream KV Persistence.** Ultra-fast in-memory reads backed by JetStream KV buckets.
+- **Cross-Replica Cache Invalidation via KV Watchers.** Every replica keeps a local in-memory table cache and invalidates entries by subscribing to the bucket's change stream.
+- **Atomic Concurrency Control.** Compare-and-swap (`cas`, `create`, `cas_delete`) built on JetStream KV revisions.
+- **Prefix Scans.** Single round-trip key & value prefix retrieval (`prefix`) ideal for hierarchical partition keys and user-scoped data.
 - **NATS ADR-32 Microservice Architecture.** Discovered and monitored via standard NATS tooling (`nats service ls`, `nats service info`, `nats service stats`, `nats service ping`).
-- **JetStream KV as the storage layer.** Tables are buckets. No other persistent state.
-- **Cross-replica cache coherence via KV watchers.** Every replica keeps a local in-memory cache and invalidates entries by subscribing to the bucket's change stream.
-- **Multi-key transactions on top of a JetStream WAL stream.** A dedicated `ldb-txn` stream records PREPARE → apply → COMMIT/ABORT. Crash recovery walks the WAL on startup with a 30-second grace window and a per-txn lock bucket so multiple replicas can recover safely without stepping on each other.
-- **Horizontal scaling via NATS queue groups.** All replicas join `{instance}-workers`; NATS distributes requests across them. Add a replica → reads scale linearly.
-- **Stateless components.** A replica can crash, restart, scale up, or scale down without any data migration. The state is in JetStream.
-
-## Performance
-
-Measured on a single Apple M-series machine, release build, loopback NATS 2.12.6, no Raft replication, 1 replica:
-
-| Scenario | Throughput | p50 | p99 |
-|---|---|---|---|
-| Reads (cache hit, 64 concurrent) | **134,100 req/s** | 0.44 ms | 1.19 ms |
-| Writes, 1 table (64 concurrent) | **9,684 req/s** | 5.50 ms | 23.74 ms |
-| Writes, 8 tables (64 concurrent) | **18,580 req/s** | 2.68 ms | 12.14 ms |
-| Transactions, 2-op (8 concurrent) | **499 txn/s** | 1.19 ms | 3.10 ms |
-
-- Reads are served from each replica's in-memory cache; the cost is one NATS round-trip.
-- Multi-table writes scale because each bucket has an independent JetStream stream leader.
-- Transactions are capped by the single global WAL stream — adding replicas does not help, since they all serialize through it.
-
-See [Running the benchmark](#running-the-benchmark) below.
+- **Stateless Components.** A replica can restart, scale up, or scale down without data migration. Persistent state resides in JetStream KV.
 
 ## Operations
 
-All requests are NATS request/reply on `ldb.{op}`. Bodies are JSON; binary values are base64-encoded.
+All requests are available over both NATS request/reply (`{instance}.{op}`) and localhost TCP framed messages. JSON payloads; binary values are base64-encoded.
 
-| Subject | Body |
-|---|---|
-| `ldb.get` / `ldb.exists` / `ldb.keys` | `{table, key, consistency?}` / `{table, cursor?, consistency?}` |
-| `ldb.put` / `ldb.create` | `{table, key, value, ttl_seconds?}` |
-| `ldb.cas` | `{table, key, value, revision, ttl_seconds?}` |
-| `ldb.delete` | `{table, key}` |
-| `ldb.cas_delete` | `{table, key, revision}` |
-| `ldb.purge` | `{table, key, revision?, ttl_seconds?}` |
-| `ldb.get_revision` | `{table, key, revision, consistency?}` — includes delete/purge tombstones |
-| `ldb.batch.get` / `ldb.batch.put` | `{table, keys: [...], consistency?}` / `{table, entries: [...]}` |
-| `ldb.scan` / `ldb.count` | `{table, filters, order_by?, limit?, offset?, key_prefix?, consistency?}` |
-| `ldb.aggregate` | `{table, filters, group_by?, ops: [{fn, field?}], consistency?}` (`count`/`sum`/`avg`/`min`/`max`) |
-| `ldb.index.create` / `ldb.index.drop` / `ldb.index.list` | `{table, field}` or `{table, fields: [...]}` (compound) |
-| `ldb.txn` | `{ops: [{op, table, key, value?}]}` — atomic, max 64 ops |
-| `ldb.schema.set` / `ldb.schema.get` / `ldb.schema.delete` | `{table, schema}` |
-| `ldb.schedule_put` | `{table, key, value, at, ttl_seconds?}` — delayed write at RFC 3339 UTC timestamp (NATS 2.14+) |
+| Operation | Request Payload | Description |
+|---|---|---|
+| `get` | `{"table": "...", "key": "...", "consistency"?: ...}` | Fetch row value & revision |
+| `put` | `{"table": "...", "key": "...", "value": "...", "ttl_seconds"?: ...}` | Upsert row with optional TTL |
+| `create` | `{"table": "...", "key": "...", "value": "...", "ttl_seconds"?: ...}` | Insert only if key does not exist |
+| `cas` | `{"table": "...", "key": "...", "value": "...", "revision": 123, "ttl_seconds"?: ...}` | Atomic compare-and-swap by revision |
+| `delete` | `{"table": "...", "key": "..."}` | Delete key |
+| `cas_delete` | `{"table": "...", "key": "...", "revision": 123}` | Atomic delete by revision |
+| `purge` | `{"table": "...", "key": "...", "revision"?: 123, "ttl_seconds"?: ...}` | Purge key tombstone |
+| `exists` | `{"table": "...", "key": "...", "consistency"?: ...}` | Check if key exists |
+| `keys` | `{"table": "...", "cursor"?: ...}` | Paginate keys in table |
+| `prefix` | `{"table": "...", "prefix": "..."}` | Fetch all rows matching key prefix |
+| `batch.get` | `{"table": "...", "keys": [...]}` | Fetch multiple keys in one round-trip |
+| `batch.put` | `{"table": "...", "entries": [...]}` | Write multiple entries in one round-trip |
+| `schema.set` | `{"table": "...", "schema": {...}}` | Set JSON validation schema |
+| `schema.get` | `{"table": "..."}` | Retrieve table schema |
+| `schema.delete`| `{"table": "..."}` | Remove table schema |
 
-Filters use `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `prefix`. Schemas validate `put` / `create` / `cas` / `batch.put`.
-
-Every mutation also publishes a change event on `ldb-events.{table}.{key}`:
+Every mutation also publishes a change event on `{instance}-events.{table}.{key}`:
 
 ```bash
-nats sub "ldb-events.users.>"
+nats sub "lid-events.users.>"
 ```
 
-Session-consistent clients can carry a per-table watermark via:
+## Configuration
 
-```json
-"consistency": { "min_revision": 123 }
+Both modern `CACHE_*` and backward-compatible `LDB_*` environment variables are supported:
+
+| Environment Variable | Fallback | Default | Effect |
+|---|---|---|---|
+| `CACHE_INSTANCE` | `LDB_INSTANCE` | `lid` | NATS subject prefix and KV bucket namespace (e.g. `lid.get`, `lid-users`) |
+| `CACHE_DATA_INSTANCE` | `LDB_DATA_INSTANCE` | (same as instance) | NATS KV bucket namespace prefix |
+| `CACHE_AUTH_TOKEN` | `LDB_AUTH_TOKEN` | (none) | Required token sent as `"_auth": "..."` |
+| `CACHE_NATS_URL` | `NATS_URL` | (none) | NATS address for messaging and request/reply |
+| `CACHE_DATA_URL` | `NATS_DATA_URL` | (same as NATS_URL) | NATS address for storage (KV buckets) |
+| `CACHE_TCP_PORT` | `LDB_TCP_PORT` / `TCP_PORT` | `4080` | Localhost TCP loopback port for co-located components |
+| `CACHE_MASTER_KEY` | `LDB_MASTER_KEY` | (none) | Master key for AES-GCM encrypted tables |
+| `CACHE_DEV_SEED` | `LDB_DEV_SEED` | (none) | Deterministic dev key derivation seed |
+
+### Rust Client
+
+```rust
+use lattice_db_client::TaikaCache; // or LatticeDb
+
+let cache = TaikaCache::new(client)
+    .with_instance("lid")
+    .with_auth("secret");
+
+// Prefix scan
+let user_keys = cache.prefix("oidc_keys", "user:1234:").await?;
 ```
-
-Write responses may include:
-
-```json
-"session": { "revisions": { "users": 123 } }
-```
-
-This enables read-your-write behavior even when traffic hops across app and storage replicas.
-
-When consistency is enabled, lattice-db derives catch-up freshness from KV stream sequence
-watermarks, not just the highest surviving row revision. This avoids false stale errors when
-the bucket has many delete/purge events (for example, high-churn expiring session keys).
-
-## Instance isolation
-
-> **Note:** Throughout this README, `ldb` is the **default instance name** — the prefix used in all subject names, KV bucket names, and the WAL stream. It is not hardcoded; every occurrence of `ldb` in the examples above (`ldb.get`, `ldb-users`, `ldb-txn`, …) becomes your chosen name when you set `LDB_INSTANCE`.
-
-Deploy one `storage-service` per application. Set `LDB_INSTANCE` in each deployment's environment; all NATS subjects, KV buckets, and WAL resources are automatically namespaced.
-
-| Env var | Effect |
-|---|---|
-| `LDB_INSTANCE=instancename` | NATS subject prefix for messaging (e.g. `instancename.get`, `instancename-events.>`) |
-| `LDB_DATA_INSTANCE=instancename` | NATS KV bucket and WAL prefix (e.g. `instancename-users`, `instancename-txn`). Defaults to `LDB_INSTANCE`. |
-| `LDB_AUTH_TOKEN=...` | Every request must include `"_auth": "<token>"` |
-| `NATS_URL=...` | NATS address for messaging (req/rep subscriptions and events). **Optional** — if omitted, NATS request/reply is disabled. |
-| `NATS_DATA_URL=...` | NATS address for storage (JetStream WAL and KV buckets). Falls back to `NATS_URL` if not set. **At least one of `NATS_URL` or `NATS_DATA_URL` must be set.** |
-| `LDB_TCP_PORT=4080` | Enable localhost TCP listener on the given port. **Optional** — if omitted, TCP is disabled. |
-| `LDB_CONSISTENCY_WATCHER_WAIT_STEPS` | Number of short watcher-poll attempts before forced table reload on consistency-gated reads. Default `2` (range `0..60`). |
-| `LDB_CONSISTENCY_WATCHER_WAIT_STEP_SECS` | Seconds per watcher-poll attempt. Default `1` (range `0..30`). |
-
-**Transport modes:** At least one of `NATS_URL` or `LDB_TCP_PORT` must be set. Both can be enabled simultaneously for hybrid deployments where some clients use NATS and co-located components use TCP.
-
-`LDB_INSTANCE` defaults to `ldb`. Allowed characters: alphanumeric, `_`, `-`; max 64 chars.
-
-This is **NATS-level isolation** — an application using instance `asd` cannot accidentally read or write `wasd` data because the subjects are different. For stricter security (separate credentials), give each deployment its own NATS account or NKey.
-
-### Rust client
 
 ```rust
 let db = LatticeDb::new(client)
@@ -281,7 +248,7 @@ Requires `nats` CLI, `jq`, `base64`. See [TESTING.md](TESTING.md) for Kubernetes
 cargo build --target wasm32-wasip2 --release -p storage-service
 
 # Build benchmark client
-cargo build --target wasm32-wasip2 --release --example bench -p lattice-db-client
+cargo build --target wasm32-wasip2 --release --example bench -p jetcache-client
 
 nats-server -js -p 14222 &
 wasmtime run -S inherit-network=y -W component-model-async=y \
@@ -301,14 +268,13 @@ Tunables: `BENCH_DURATION_SECS` (10), `BENCH_CONCURRENCY` (64), `BENCH_TXN_CONCU
 ## Project layout
 
 ```
-storage-service/    # the database (wasm component)
-  src/main.rs       #   NATS connection, queue subscription, watchers, WAL recovery
+storage-service/    # the cache service (wasm component)
+  src/main.rs       #   NATS connection, queue subscription, watchers
   src/tcp_server.rs #   localhost TCP listener for co-located component access
   src/handler.rs    #   request dispatch for all {instance}.* operations
-  src/state.rs      #   in-memory cache, indexes, query engine, aggregation
+  src/state.rs      #   in-memory cache
   src/store.rs      #   NATS KV persistence
-  src/txn.rs        #   WAL-backed transactions
-lattice-db-client/  # typed Rust SDK (published on crates.io)
+jetcache-client/    # typed Rust SDK (published on crates.io)
   examples/bench.rs #   the benchmark used above
 deploy/             # Kind + wasmCloud local environment
 tests/              # integration test suites
@@ -318,8 +284,8 @@ tests/              # integration test suites
 
 | Crate | Description |
 |---|---|
-| `storage-service` | The database service |
-| [`lattice-db-client`](lattice-db-client/) | Typed Rust SDK |
+| `storage-service` | The cache service |
+| [`jetcache-client`](jetcache-client/) | Typed Rust SDK |
 | [`nats-wasip3`](https://crates.io/crates/nats-wasip3) | NATS client for WASI 0.3 / `wasm32-wasip2` (published separately) |
 
 ## License

@@ -29,7 +29,7 @@
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use lattice_db_client::{LatticeDb, TxnOp};
+use jetcache_client::{JetCache as LatticeDb, TxnOp};
 use nats_wasi::client::{Client, ConnectConfig};
 use std::pin::Pin;
 

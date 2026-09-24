@@ -44,8 +44,11 @@ const MIN_ENVELOPE_LEN: usize = 1 + NONCE_LEN + 16;
 ///
 /// Caching is intentionally left to the caller (call once at startup).
 pub fn load_master_key() -> [u8; 32] {
-    // Production path: LDB_MASTER_KEY as hex or base64, must be 32+ bytes.
-    if let Ok(raw) = std::env::var("LDB_MASTER_KEY") {
+    // Production path: JETCACHE_MASTER_KEY / CACHE_MASTER_KEY / LDB_MASTER_KEY as hex or base64, must be 32+ bytes.
+    let master_env = std::env::var("JETCACHE_MASTER_KEY")
+        .or_else(|_| std::env::var("CACHE_MASTER_KEY"))
+        .or_else(|_| std::env::var("LDB_MASTER_KEY"));
+    if let Ok(raw) = master_env {
         let raw = raw.trim().to_string();
         // Try hex first, then base64.
         let bytes = if raw.len() >= 64 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -54,11 +57,11 @@ pub fn load_master_key() -> [u8; 32] {
             base64_decode(&raw)
         };
         let bytes = bytes.expect(
-            "LDB_MASTER_KEY must be a hex (64+ chars) or base64-encoded value of at least 32 bytes",
+            "JETCACHE_MASTER_KEY / CACHE_MASTER_KEY / LDB_MASTER_KEY must be a hex (64+ chars) or base64-encoded value of at least 32 bytes",
         );
         if bytes.len() < 32 {
             panic!(
-                "LDB_MASTER_KEY must be at least 32 bytes (got {})",
+                "JETCACHE_MASTER_KEY / CACHE_MASTER_KEY / LDB_MASTER_KEY must be at least 32 bytes (got {})",
                 bytes.len()
             );
         }
@@ -67,19 +70,22 @@ pub fn load_master_key() -> [u8; 32] {
         return key;
     }
 
-    // Dev path: LDB_DEV_SEED — deterministic HKDF-derived key.
-    if let Ok(seed) = std::env::var("LDB_DEV_SEED") {
+    // Dev path: JETCACHE_DEV_SEED / CACHE_DEV_SEED / LDB_DEV_SEED — deterministic HKDF-derived key.
+    let dev_seed_env = std::env::var("JETCACHE_DEV_SEED")
+        .or_else(|_| std::env::var("CACHE_DEV_SEED"))
+        .or_else(|_| std::env::var("LDB_DEV_SEED"));
+    if let Ok(seed) = dev_seed_env {
         eprintln!(
-            "lattice-db: WARNING — using LDB_DEV_SEED for encryption. \
-             Never use this in production. Set LDB_MASTER_KEY instead."
+            "jetcache: WARNING — using JETCACHE_DEV_SEED / CACHE_DEV_SEED / LDB_DEV_SEED for encryption. \
+             Never use this in production. Set JETCACHE_MASTER_KEY instead."
         );
         return derive_dev_key(&seed);
     }
 
     // Neither set: fail fast.
     panic!(
-        "lattice-db: encryption is enabled for one or more tables but no master key is \
-         configured. Set LDB_MASTER_KEY (production) or LDB_DEV_SEED (development only)."
+        "jetcache: encryption is enabled for one or more tables but no master key is \
+         configured. Set JETCACHE_MASTER_KEY (production) or JETCACHE_DEV_SEED (development only)."
     );
 }
 

@@ -15,7 +15,7 @@
 //!     --env NATS_URL=127.0.0.1:14222 \
 //!     target/wasm32-wasip3/debug/examples/smoke_test.wasm
 
-use lattice_db_client::*;
+use jetcache_client::*;
 use nats_wasi::client::{Client, ConnectConfig};
 
 fn nats_address() -> String {

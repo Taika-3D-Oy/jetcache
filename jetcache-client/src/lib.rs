@@ -1,43 +1,31 @@
-//! # lattice-db-client
+//! # jetcache-client
 //!
-//! Typed Rust SDK for [lattice-db](https://github.com/Taika-3D-Oy/lattice-db) — a
-//! NATS-native distributed database for wasmCloud.
+//! Typed Rust SDK for [jetcache](https://github.com/Taika-3D-Oy/jetcache) (formerly `lattice-db`) —
+//! an in-memory read-through cache for wasmCloud backed by NATS JetStream KV.
 //!
 //! Wraps the NATS request/reply wire protocol with ergonomic Rust methods.
 //! Values are transparently base64-encoded on the wire but exposed as raw
 //! bytes (`&[u8]` / `Vec<u8>`) to the caller. JSON convenience methods are
-//! provided via [`LatticeDb::get_json`] and [`LatticeDb::put_json`].
+//! provided via [`JetCache::get_json`] and [`JetCache::put_json`].
 //!
 //! ## Quick start
 //!
 //! ```rust,no_run
 //! use nats_wasi::client::{Client, ConnectConfig};
-//! use lattice_db_client::LatticeDb;
+//! use jetcache_client::JetCache;
 //!
-//! # async fn example() -> Result<(), lattice_db_client::Error> {
+//! # async fn example() -> Result<(), jetcache_client::Error> {
 //! let client = Client::connect(ConnectConfig::default()).await?;
-//! let db = LatticeDb::new(client)
-//!     .with_auth("my-token")          // matches LDB_AUTH_TOKEN on the server
-//!     .with_instance("acme");          // matches LDB_INSTANCE=acme on the server
+//! let cache = JetCache::new(client)
+//!     .with_auth("my-token")          // matches JETCACHE_AUTH_TOKEN on the server
+//!     .with_instance("lid");          // matches JETCACHE_INSTANCE=lid on the server
 //!
 //! // Store and retrieve JSON
-//! db.put_json("users", "alice", &serde_json::json!({"name": "Alice", "age": 30})).await?;
-//! let user: serde_json::Value = db.get_json("users", "alice").await?;
+//! cache.put_json("users", "alice", &serde_json::json!({"name": "Alice", "age": 30})).await?;
+//! let user: serde_json::Value = cache.get_json("users", "alice").await?;
 //!
-//! // Scan with filters
-//! use lattice_db_client::{Filter, ScanQuery};
-//! let results = db.scan("users", ScanQuery::new()
-//!     .filter("age", "gte", "25")
-//!     .order_by("name", "asc")
-//!     .limit(10)
-//! ).await?;
-//!
-//! // Atomic transactions
-//! use lattice_db_client::TxnOp;
-//! db.transaction(vec![
-//!     TxnOp::put("accounts", "alice", b"{\"balance\":90}"),
-//!     TxnOp::put("accounts", "bob",   b"{\"balance\":110}"),
-//! ]).await?;
+//! // Prefix query
+//! let rows = cache.prefix("users", "ali").await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -342,6 +330,12 @@ struct KeysReqW<'a> {
 }
 
 #[derive(Serialize)]
+struct PrefixReqW<'a> {
+    table: &'a str,
+    prefix: &'a str,
+}
+
+#[derive(Serialize)]
 struct ScanReqW<'a> {
     table: &'a str,
     filters: &'a [Filter],
@@ -421,6 +415,7 @@ struct SchedulePutReqW<'a> {
 #[derive(Deserialize)] struct RevisionR { revision: u64 }
 #[derive(Deserialize)] struct ExistsR { exists: bool }
 #[derive(Deserialize)] struct KeysR { keys: Vec<String>, cursor: Option<u64> }
+#[derive(Deserialize)] struct PrefixR { rows: Vec<RowR> }
 #[derive(Deserialize)] struct ScanR { rows: Vec<RowR>, total_count: u64 }
 #[derive(Deserialize)] struct CountR { count: u64 }
 #[derive(Deserialize)] struct IndexesR { indexes: Vec<String> }
@@ -437,18 +432,25 @@ struct SchedulePutReqW<'a> {
 
 // ── Client ─────────────────────────────────────────────────────────
 
-/// Typed client for lattice-db. Wraps a NATS client and forwards
+/// Typed client for jetcache. Wraps a NATS client and forwards
 /// requests to the `{instance}.>` subject tree.
 pub struct LatticeDb {
     client: Client,
     timeout: Duration,
-    /// Value sent as `_auth` on every request. Must match `LDB_AUTH_TOKEN`.
+    /// Value sent as `_auth` on every request. Must match `JETCACHE_AUTH_TOKEN` / `CACHE_AUTH_TOKEN` / `LDB_AUTH_TOKEN`.
     auth_token: Option<String>,
-    /// NATS subject prefix. Must match `LDB_INSTANCE` on the server (default `ldb`).
+    /// NATS subject prefix. Must match `JETCACHE_INSTANCE` / `CACHE_INSTANCE` / `LDB_INSTANCE` on the server (default `lid`).
     instance: String,
     /// Session-level per-table minimum revisions for read-your-write behavior.
     session_revisions: RefCell<HashMap<String, u64>>,
 }
+
+/// Primary client struct for jetcache.
+pub type JetCache = LatticeDb;
+/// Backwards-compatible alias for JetCache.
+pub type TaikaCache = LatticeDb;
+/// Backwards-compatible alias for JetCache.
+pub type LatticeCache = LatticeDb;
 
 impl LatticeDb {
     /// Create a new client with the default 5-second timeout.
@@ -665,9 +667,25 @@ impl LatticeDb {
         Ok(KeysPage { keys: resp.keys, cursor: resp.cursor })
     }
 
-    // ── Query ──────────────────────────────────────────────────
+    /// Fetch all keys matching a prefix with their values and revisions in a single round-trip.
+    pub async fn prefix(&self, table: &str, prefix: &str) -> Result<Vec<Row>, Error> {
+        let resp: PrefixR = self.req(&self.subj("prefix"), &PrefixReqW { table, prefix }).await?;
+        resp.rows
+            .into_iter()
+            .map(|r| -> Result<Row, Error> {
+                Ok(Row {
+                    key: r.key,
+                    value: B64.decode(&r.value).map_err(|e| Error::Base64(e.to_string()))?,
+                    revision: r.revision,
+                })
+            })
+            .collect()
+    }
+
+    // ── Query (Deprecated in jetcache v2.0) ───────────────────
 
     /// Scan rows with filters, sorting, and pagination.
+    #[deprecated(note = "Removed in jetcache v2.0")]
     pub async fn scan(&self, table: &str, query: ScanQuery) -> Result<ScanResult, Error> {
         let order_by = query.order_by.map(|(f, o)| SortByW { field: f, order: o });
         let resp: ScanR = self.req(&self.subj("scan"), &ScanReqW {
@@ -689,6 +707,7 @@ impl LatticeDb {
     }
 
     /// Count rows matching filters.
+    #[deprecated(note = "Removed in jetcache v2.0")]
     pub async fn count(&self, table: &str, filters: &[Filter]) -> Result<u64, Error> {
         let resp: CountR = self.req(&self.subj("count"), &CountReqW { table, filters }).await?;
         Ok(resp.count)
@@ -717,9 +736,10 @@ impl LatticeDb {
         Ok(resp.results.into_iter().map(|r| BatchPutResult { key: r.key, revision: r.revision }).collect())
     }
 
-    // ── Indexes ────────────────────────────────────────────────
+    // ── Indexes (Deprecated in jetcache v2.0) ─────────────────
 
     /// Create a single-field secondary index.
+    #[deprecated(note = "Removed in jetcache v2.0")]
     pub async fn create_index(&self, table: &str, field: &str) -> Result<(), Error> {
         let _: serde_json::Value = self.req(&self.subj("index.create"), &IndexCreateReqW {
             table, field: Some(field), fields: None,
@@ -728,6 +748,7 @@ impl LatticeDb {
     }
 
     /// Create a compound (multi-field) index.
+    #[deprecated(note = "Removed in jetcache v2.0")]
     pub async fn create_compound_index(&self, table: &str, fields: &[&str]) -> Result<(), Error> {
         let _: serde_json::Value = self.req(&self.subj("index.create"), &IndexCreateReqW {
             table, field: None, fields: Some(fields.to_vec()),
@@ -736,28 +757,32 @@ impl LatticeDb {
     }
 
     /// Drop an index.
+    #[deprecated(note = "Removed in jetcache v2.0")]
     pub async fn drop_index(&self, table: &str, field: &str) -> Result<(), Error> {
         let _: serde_json::Value = self.req(&self.subj("index.drop"), &FieldReqW { table, field }).await?;
         Ok(())
     }
 
     /// List all indexes on a table.
+    #[deprecated(note = "Removed in jetcache v2.0")]
     pub async fn list_indexes(&self, table: &str) -> Result<Vec<String>, Error> {
         let resp: IndexesR = self.req(&self.subj("index.list"), &TableReq { table }).await?;
         Ok(resp.indexes)
     }
 
-    // ── Transactions ───────────────────────────────────────────
+    // ── Transactions (Deprecated in jetcache v2.0) ───────────
 
     /// Execute an atomic multi-key transaction.
+    #[deprecated(note = "Removed in jetcache v2.0; use CAS + create")]
     pub async fn transaction(&self, ops: Vec<TxnOp>) -> Result<TxnResult, Error> {
         let resp: TxnR = self.req(&self.subj("txn"), &TxnReqW { ops }).await?;
         Ok(TxnResult { ok: resp.ok, results: resp.results })
     }
 
-    // ── Aggregation ────────────────────────────────────────────
+    // ── Aggregation (Deprecated in jetcache v2.0) ────────────
 
     /// Run aggregation operations, optionally grouped.
+    #[deprecated(note = "Removed in jetcache v2.0")]
     pub async fn aggregate(
         &self,
         table: &str,
@@ -792,17 +817,7 @@ impl LatticeDb {
     }
 
     /// Register a one-shot delayed write (NATS 2.14+ message scheduling).
-    ///
-    /// The NATS server persists the `value` and performs the write to `table`/`key`
-    /// when the RFC 3339 UTC timestamp `at` arrives.  Requires the server to run
-    /// NATS ≥ 2.14.
-    ///
-    /// # Example
-    /// ```rust,no_run
-    /// # async fn example(db: lattice_db_client::LatticeDb) -> Result<(), lattice_db_client::Error> {
-    /// db.schedule_put("orders", "order-42", b"{\"status\":\"shipped\"}", "2026-06-01T09:00:00Z").await?;
-    /// # Ok(()) }
-    /// ```
+    #[deprecated(note = "Removed in jetcache v2.0")]
     pub async fn schedule_put(&self, table: &str, key: &str, value: &[u8], at: &str) -> Result<(), Error> {
         let _: serde_json::Value = self.req(&self.subj("schedule_put"), &SchedulePutReqW {
             table,
@@ -816,6 +831,7 @@ impl LatticeDb {
 
     /// Like [`schedule_put`][Self::schedule_put] but the written key also gets a TTL,
     /// so the key expires `ttl_seconds` after it is written.
+    #[deprecated(note = "Removed in jetcache v2.0")]
     pub async fn schedule_put_with_ttl(&self, table: &str, key: &str, value: &[u8], at: &str, ttl_seconds: u64) -> Result<(), Error> {
         let _: serde_json::Value = self.req(&self.subj("schedule_put"), &SchedulePutReqW {
             table,

@@ -1,5 +1,43 @@
 # Changelog
 
+## [2.0.0-rc.1] - 2026-09-24
+
+### Major Architecture & Rebranding
+
+- **Rebranded to `jetcache`**:
+  - Rebranded project from `lattice-db` to `jetcache`, aligning with wasmCloud 2.0+ and NATS JetStream KV architecture.
+  - Renamed client crate to `jetcache-client` on crates.io.
+  - Added `JetCache` as primary client struct with `TaikaCache` and `LatticeDb` type aliases for backward compatibility.
+  - Updated GitHub repository links to `https://github.com/Taika-3D-Oy/jetcache`.
+
+- **Pruned Unused Subsystems & Transitioned to Pure In-Memory Read-Through Cache**:
+  - Removed `lattice-sql` and `lattice-sql-client` crates from workspace.
+  - Removed WAL two-phase commit transactions (`txn.rs`), transaction lock buckets, and recovery crash replay. Concurrency is powered by atomic JetStream KV CAS (`cas`, `create`, `cas_delete`).
+  - Removed secondary indexing (`index.create`, `index.drop`, `index.list`), AST filter queries, and aggregations (`scan`, `count`, `aggregate`).
+  - Removed scheduled write workers (`schedule.rs`).
+  - Simplified in-memory state in `state.rs` to a lean `HashMap<String, CachedRow>` per table.
+
+### Added
+
+- **Single Round-Trip `prefix` Endpoint**:
+  - Added `prefix` operation across `storage-service` (ADR-32 microservice & local TCP) and `jetcache-client` SDK (`cache.prefix(table, prefix)`).
+  - Fetches all keys, values, and revisions matching a key prefix in a single round-trip without requiring secondary indexes or client-side pagination.
+- **Flexible Cursor Support**:
+  - Handled both string and numeric cursors in `KeysReq` and emitted dual `cursor` / `next_cursor` in `KeysResp` for seamless pagination across varied client SDK versions.
+- **Cascading Configuration Hierarchy**:
+  - Supported `JETCACHE_*` configuration variables (`JETCACHE_INSTANCE`, `JETCACHE_DATA_INSTANCE`, `JETCACHE_TCP_PORT`, `JETCACHE_AUTH_TOKEN`, `JETCACHE_MASTER_KEY`, `JETCACHE_DEV_SEED`, `JETCACHE_CONSISTENCY_WATCHER_WAIT_STEPS`) with fallbacks to `CACHE_*` and legacy `LDB_*`.
+
+### Dependencies
+
+- **`nats-wasip3` v1.0.0-rc.1**:
+  - Upgraded from `0.12.0` to `1.0.0-rc.1` across `storage-service` and `jetcache-client`.
+
+### CI/CD
+
+- **Automated Crates.io & OCI Release Pipelines**:
+  - Configured GitHub Actions workflow (`publish-clients.yml`) to publish `jetcache-client` to crates.io on `v*` tags or manual `workflow_dispatch`.
+  - Updated container image publishing in `release.yml` to `ghcr.io/taika-3d-oy/jetcache/storage-service`.
+
 ## [1.11.1] - 2026-09-23
 
 ### Security

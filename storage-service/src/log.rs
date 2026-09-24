@@ -2,6 +2,7 @@
 /// Formats log messages as JSON to stderr for easy parsing and filtering.
 use std::fmt;
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum Level {
     Info,
@@ -21,12 +22,14 @@ impl fmt::Display for Level {
 
 /// Structured JSON log entry.
 /// Fields are added via builder pattern.
+#[allow(dead_code)]
 pub struct Log {
     level: Level,
     message: String,
     fields: Vec<(String, String)>,
 }
 
+#[allow(dead_code)]
 impl Log {
     pub fn info(msg: impl Into<String>) -> Self {
         Log {

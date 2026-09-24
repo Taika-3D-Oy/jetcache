@@ -2,148 +2,56 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::state::{matches_filters, Comparison, FieldFilter};
+    use crate::state::TableState;
 
     // ──────────────────────────────────────────────────────────────────
-    // Filter & Index Tests
+    // In-memory TableState & Prefix Tests
     // ──────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_filter_eq_match() {
-        let filter = FieldFilter {
-            field: "status".to_string(),
-            cmp: Comparison::Eq("active".to_string()),
-        };
-        let json = br#"{"status":"active","id":1}"#;
-        assert!(matches_filters(json, &[filter]));
+    fn test_table_state_upsert_and_get() {
+        let mut table = TableState::new();
+        table.upsert("user:101", b"{\"name\":\"alice\"}".to_vec(), 1);
+        table.upsert("user:102", b"{\"name\":\"bob\"}".to_vec(), 2);
+        table.upsert("session:abc", b"{\"uid\":\"101\"}".to_vec(), 3);
+
+        assert_eq!(table.data.len(), 3);
+        assert_eq!(table.data.get("user:101").unwrap().revision, 1);
+        assert_eq!(table.data.get("user:102").unwrap().revision, 2);
+        assert_eq!(table.data.get("session:abc").unwrap().revision, 3);
     }
 
     #[test]
-    fn test_filter_eq_no_match() {
-        let filter = FieldFilter {
-            field: "status".to_string(),
-            cmp: Comparison::Eq("active".to_string()),
-        };
-        let json = br#"{"status":"inactive","id":1}"#;
-        assert!(!matches_filters(json, &[filter]));
+    fn test_table_state_delete() {
+        let mut table = TableState::new();
+        table.upsert("k1", b"v1".to_vec(), 1);
+        assert!(table.data.contains_key("k1"));
+
+        table.remove("k1");
+        table.note_applied_revision(2);
+        assert!(!table.data.contains_key("k1"));
+        assert_eq!(table.applied_revision, 2);
     }
 
     #[test]
-    fn test_filter_prefix_match() {
-        let filter = FieldFilter {
-            field: "email".to_string(),
-            cmp: Comparison::Prefix("user@".to_string()),
-        };
-        let json = br#"{"email":"user@example.com"}"#;
-        assert!(matches_filters(json, &[filter]));
-    }
+    fn test_prefix_filtering() {
+        let mut table = TableState::new();
+        table.upsert("refresh_idx:u1:t1", b"v1".to_vec(), 1);
+        table.upsert("refresh_idx:u1:t2", b"v2".to_vec(), 2);
+        table.upsert("refresh_idx:u2:t3", b"v3".to_vec(), 3);
+        table.upsert("user:u1", b"user_data".to_vec(), 4);
 
-    #[test]
-    fn test_filter_gt_match() {
-        let filter = FieldFilter {
-            field: "score".to_string(),
-            cmp: Comparison::Gt("50".to_string()),
-        };
-        let json = br#"{"score":"75"}"#;
-        assert!(matches_filters(json, &[filter]));
-    }
+        let prefix = "refresh_idx:u1:";
+        let matches: Vec<String> = table
+            .data
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect();
 
-    #[test]
-    fn test_filter_gte_match() {
-        let filter = FieldFilter {
-            field: "score".to_string(),
-            cmp: Comparison::Gte("50".to_string()),
-        };
-        let json = br#"{"score":"50"}"#;
-        assert!(matches_filters(json, &[filter]));
-    }
-
-    #[test]
-    fn test_filter_lt_match() {
-        let filter = FieldFilter {
-            field: "age".to_string(),
-            cmp: Comparison::Lt("18".to_string()),
-        };
-        let json = br#"{"age":"16"}"#;
-        assert!(matches_filters(json, &[filter]));
-    }
-
-    #[test]
-    fn test_filter_lte_match() {
-        let filter = FieldFilter {
-            field: "age".to_string(),
-            cmp: Comparison::Lte("18".to_string()),
-        };
-        let json = br#"{"age":"18"}"#;
-        assert!(matches_filters(json, &[filter]));
-    }
-
-    #[test]
-    fn test_multiple_filters_all_match() {
-        let filters = vec![
-            FieldFilter {
-                field: "status".to_string(),
-                cmp: Comparison::Eq("active".to_string()),
-            },
-            FieldFilter {
-                field: "role".to_string(),
-                cmp: Comparison::Eq("admin".to_string()),
-            },
-        ];
-        let json = br#"{"status":"active","role":"admin"}"#;
-        assert!(matches_filters(json, &filters));
-    }
-
-    #[test]
-    fn test_multiple_filters_one_fails() {
-        let filters = vec![
-            FieldFilter {
-                field: "status".to_string(),
-                cmp: Comparison::Eq("active".to_string()),
-            },
-            FieldFilter {
-                field: "role".to_string(),
-                cmp: Comparison::Eq("admin".to_string()),
-            },
-        ];
-        let json = br#"{"status":"active","role":"user"}"#;
-        assert!(!matches_filters(json, &filters));
-    }
-
-    #[test]
-    fn test_neq_match() {
-        let filter = FieldFilter {
-            field: "status".to_string(),
-            cmp: Comparison::Neq("deleted".to_string()),
-        };
-        let json = br#"{"status":"active"}"#;
-        assert!(matches_filters(json, &[filter]));
-    }
-
-    #[test]
-    fn test_neq_no_match() {
-        let filter = FieldFilter {
-            field: "status".to_string(),
-            cmp: Comparison::Neq("deleted".to_string()),
-        };
-        let json = br#"{"status":"deleted"}"#;
-        assert!(!matches_filters(json, &[filter]));
-    }
-
-    #[test]
-    fn test_filter_missing_field() {
-        let filter = FieldFilter {
-            field: "nonexistent".to_string(),
-            cmp: Comparison::Eq("value".to_string()),
-        };
-        let json = br#"{"status":"active"}"#;
-        assert!(!matches_filters(json, &[filter]));
-    }
-
-    #[test]
-    fn test_empty_filter_list() {
-        let json = br#"{"status":"active"}"#;
-        assert!(matches_filters(json, &[]));
+        assert_eq!(matches.len(), 2);
+        assert!(matches.contains(&"refresh_idx:u1:t1".to_string()));
+        assert!(matches.contains(&"refresh_idx:u1:t2".to_string()));
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -189,7 +97,6 @@ mod tests {
         let ttl_secs = 0u64;
         let duration = Duration::from_secs(ttl_secs);
         assert_eq!(duration.as_secs(), 0);
-        // Zero TTL should expire immediately (or not be set)
     }
 
     #[test]
@@ -201,112 +108,7 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // Transaction ID Generation Tests
-    // ──────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_txn_id_format() {
-        // txn IDs should be in format: hex-counter (with dash separator)
-        let id1 = "1a2b3c-0001";
-        let id2 = "deadbeef-ffff";
-        // Must contain dash separator for format validation
-        assert!(id1.contains('-'));
-        assert!(id2.contains('-'));
-        // Should have two parts when split
-        assert_eq!(id1.split('-').count(), 2);
-        assert_eq!(id2.split('-').count(), 2);
-    }
-
-    #[test]
-    fn test_txn_id_collision_probability() {
-        // With 64-bit counter, collision probability is very low
-        // This is a theoretical test - actual collisions are nearly impossible
-        let max_64bit = u64::MAX;
-        let collision_window = 1_000_000u64;
-        // Probability of collision in 1M attempts on 64-bit space is negligible
-        assert!(max_64bit > collision_window * 1000);
-    }
-
-    // ──────────────────────────────────────────────────────────────────
-    // Compound Index Tests
-    // ──────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_compound_index_key_format() {
-        // Compound index keys use \x1f separator
-        let field1 = "alice";
-        let field2 = "active";
-        let key = format!("{}\x1f{}", field1, field2);
-        assert_eq!(key, "alice\x1factive");
-        assert!(key.len() > field1.len() + field2.len());
-    }
-
-    #[test]
-    fn test_compound_index_distinctness() {
-        // Different field combinations must produce different keys
-        let key1 = format!("{}\x1f{}", "alice", "active");
-        let key2 = format!("{}\x1f{}", "bob", "active");
-        let key3 = format!("{}\x1f{}", "alice", "inactive");
-        assert_ne!(key1, key2);
-        assert_ne!(key1, key3);
-        assert_ne!(key2, key3);
-    }
-
-    // ──────────────────────────────────────────────────────────────────
-    // Index Persistence Tests
-    // ──────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_index_json_serialization() {
-        let index_def = serde_json::json!({
-            "table": "users",
-            "name": "email_idx",
-            "fields": ["email"]
-        });
-        let json_str = serde_json::to_string(&index_def).unwrap();
-        assert!(json_str.contains("users"));
-        assert!(json_str.contains("email_idx"));
-    }
-
-    #[test]
-    fn test_compound_index_json_serialization() {
-        let index_def = serde_json::json!({
-            "table": "users",
-            "name": "status_role_idx",
-            "fields": ["status", "role"]
-        });
-        let json_str = serde_json::to_string(&index_def).unwrap();
-        assert!(json_str.contains("status_role_idx"));
-        assert!(json_str.contains("status"));
-        assert!(json_str.contains("role"));
-    }
-
-    #[test]
-    fn test_index_key_format_for_kv_storage() {
-        // Index definitions stored in KV use "table.index_name" as key
-        let table = "users";
-        let index_name = "email_idx";
-        let kv_key = format!("{}.{}", table, index_name);
-        assert_eq!(kv_key, "users.email_idx");
-    }
-
-    // ──────────────────────────────────────────────────────────────────
-    // WAL Configuration Tests
-    // ──────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_wal_discard_policy_prevents_loss() {
-        // DiscardPolicy::New means back-pressure when stream is full
-        // No silent drops - ordering guaranteed
-        // This is a configuration validation test
-        let policy_name = "DiscardPolicy::New";
-        assert!(policy_name.contains("New"));
-        // Confirms we're using "New" not "Old"
-        assert!(!policy_name.contains("Old"));
-    }
-
-    // ──────────────────────────────────────────────────────────────────
-    // Security Fix Tests (S-01, S-02, S-03, S-04, S-08)
+    // Security Fix Tests (S-01, S-03, S-04, S-08)
     // ──────────────────────────────────────────────────────────────────
 
     // S-01: reserved table name rejection
@@ -334,29 +136,10 @@ mod tests {
     }
 
     #[test]
-    fn test_txn_reserved_table_rejected() {
-        let payload = br#"{"ops":[{"op":"put","table":"_indexes","key":"k","value":"e30="}]}"#;
-        let result = crate::handler::check_no_reserved_tables("txn", payload);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_txn_normal_tables_allowed() {
-        let payload = br#"{"ops":[{"op":"put","table":"users","key":"k","value":"e30="}]}"#;
-        let result = crate::handler::check_no_reserved_tables("txn", payload);
-        assert!(result.is_ok());
-    }
-
-    #[test]
     fn test_sql_catalog_allowed() {
         let payload = br#"{"table":"_sql_catalog","key":"users","value":"e30="}"#;
         let result = crate::handler::check_no_reserved_tables("put", payload);
         assert!(result.is_ok());
-
-        let txn_payload =
-            br#"{"ops":[{"op":"put","table":"_sql_catalog","key":"k","value":"e30="}]}"#;
-        let txn_result = crate::handler::check_no_reserved_tables("txn", txn_payload);
-        assert!(txn_result.is_ok());
     }
 
     #[test]
@@ -451,7 +234,6 @@ mod tests {
 
     #[test]
     fn test_json_escape_control_chars_escape_seq() {
-        // ANSI escape sequence (terminal injection risk)
         let input = "\x1b[31mred\x1b[0m";
         let output = crate::log::escape_json_string(input);
         assert!(!output.contains('\x1b'));
@@ -460,7 +242,6 @@ mod tests {
 
     #[test]
     fn test_json_escape_known_chars_still_work() {
-        // Existing escapes must not regress
         let input = "a\"b\\c\nd\re\tf";
         let output = crate::log::escape_json_string(input);
         assert!(output.contains("\\\""));
