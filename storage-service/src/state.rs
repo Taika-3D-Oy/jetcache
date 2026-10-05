@@ -257,14 +257,16 @@ pub fn compound_index_key(data: &[u8], fields: &[String]) -> Option<String> {
 }
 
 /// Validate a JSON value against a schema definition.
+/// Schemas without a `fields` map (e.g. encryption-only schemas) impose no
+/// constraints on the value's shape.
 pub fn validate_schema(data: &[u8], schema: &serde_json::Value) -> Result<(), String> {
+    let Some(fields) = schema.get("fields").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
     let obj: serde_json::Value =
         serde_json::from_slice(data).map_err(|e| format!("value is not valid JSON: {e}"))?;
     let serde_json::Value::Object(ref map) = obj else {
         return Err("value must be a JSON object".into());
-    };
-    let Some(fields) = schema.get("fields").and_then(|v| v.as_object()) else {
-        return Ok(());
     };
     for (field_name, field_def) in fields {
         let required = field_def
@@ -573,5 +575,30 @@ fn compute_agg(op: &AggOp, rows: &[(&String, &CachedRow)]) -> AggResult {
             field: op.field.clone(),
             value: serde_json::Value::Null,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_schema;
+    use serde_json::json;
+
+    #[test]
+    fn schema_without_fields_accepts_any_json_value() {
+        let schema = json!({"encrypted": true});
+        assert!(validate_schema(br#""plain string""#, &schema).is_ok());
+        assert!(validate_schema(br#"["a","b"]"#, &schema).is_ok());
+        assert!(validate_schema(br#"{"a":1}"#, &schema).is_ok());
+        assert!(validate_schema(b"1", &schema).is_ok());
+        assert!(validate_schema(b"not json", &schema).is_ok());
+    }
+
+    #[test]
+    fn schema_with_fields_requires_object_and_enforces_rules() {
+        let schema = json!({"fields": {"email": {"type": "string", "required": true}}});
+        assert!(validate_schema(br#"{"email":"a@b.c"}"#, &schema).is_ok());
+        assert!(validate_schema(br#""plain string""#, &schema).is_err());
+        assert!(validate_schema(br#"{"other":1}"#, &schema).is_err());
+        assert!(validate_schema(br#"{"email":42}"#, &schema).is_err());
     }
 }

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.11.2] - 2026-10-05
+
+### Fixed
+
+- **Schema validation no longer applies to encryption-only schemas**: `validate_schema` now returns early when the schema declares no `fields` map, so setting `"encrypted": true` on a table does not impose a JSON-object-only constraint on its values. Previously, enabling encryption on tables containing non-object values (plain strings, arrays, numbers) made those keys unwritable and blocked plaintext→ciphertext migration rewrites.
+
 ## [1.11.1] - 2026-09-23
 
 ### Security
