@@ -30,6 +30,17 @@ spec:
               JETCACHE_DATA_INSTANCE: "lid"
               JETCACHE_CONSISTENCY_WATCHER_WAIT_STEPS: "2"
               JETCACHE_CONSISTENCY_WATCHER_WAIT_STEP_SECS: "1"
+              # Encryption at rest is ON by default — the service refuses to
+              # boot without a master key. Provide a 32+ byte key as hex or
+              # base64 (inject from a Secret in real deployments):
+              # JETCACHE_MASTER_KEY: "0123456789abcdef..."
+              # Development-only alternative (deterministic key, NOT for production):
+              # JETCACHE_DEV_SEED: "change-me"
+              # Emergency escape hatch: run fully unencrypted (NOT recommended):
+              # JETCACHE_ALLOW_PLAINTEXT: "1"
+              # Temporary migration window for data written before encryption
+              # became the default (remove once logs show no legacy values):
+              # JETCACHE_MIGRATE_PLAINTEXT: "1"
       hostInterfaces:
         # Required so the service can open outgoing TCP connections to NATS.
         - namespace: wasi

@@ -67,4 +67,5 @@ echo ""
 exec wasmtime run \
   --inherit-network \
   --env NATS_URL=127.0.0.1:${NATS_PORT} \
+  --env LDB_DEV_SEED=lattice-db-local-dev \
   target/wasm32-wasip2/debug/storage-service.wasm

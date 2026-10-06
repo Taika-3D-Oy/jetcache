@@ -84,6 +84,10 @@ fn build_connect_config(address: String, name: &str, use_tls: bool, is_data: boo
 
 
 async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve encryption mode first — fail closed before touching the network
+    // if no master key is configured and plaintext was not explicitly allowed.
+    handler::init_encryption_mode()?;
+
     // Determine which transport modes are enabled.
     let nats_url = get_env_opt(&["JETCACHE_NATS_URL", "CACHE_NATS_URL", "NATS_URL"])
         .or_else(|| std::env::args().nth(1));
@@ -191,7 +195,7 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     // Watch `_meta` epoch key so all replicas converge when any peer starts.
     {
         let epoch_kv = meta_kv.clone();
-        wasip3::spawn(async move {
+        wasip3::spawn_local(async move {
             let mut since = 0u64;
             loop {
                 let watcher_res = if since == 0 {
@@ -262,10 +266,10 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
                 let mut s = shared_state.borrow_mut();
                 for entry in &entries {
                     if let Ok(schema) = serde_json::from_slice::<serde_json::Value>(&entry.value) {
-                        let enc = schema
-                            .get("encrypted")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
+                        let enc = handler::resolve_schema_encryption(
+                            &entry.key,
+                            schema.get("encrypted").and_then(|v| v.as_bool()),
+                        );
                         let ts = s.table(&entry.key);
                         ts.schema = Some(schema);
                         ts.encrypted = enc;
@@ -281,7 +285,7 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             // stop schema propagation across replicas.
             let schema_state = shared_state.clone();
             let schema_kv_handle = kv.clone();
-            wasip3::spawn(async move {
+            wasip3::spawn_local(async move {
                 let mut since = last_seq;
                 loop {
                     let watcher_res = if since == 0 {
@@ -316,10 +320,10 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Ok(schema) =
                                     serde_json::from_slice::<serde_json::Value>(&entry.value)
                                 {
-                                    let enc = schema
-                                        .get("encrypted")
-                                        .and_then(|v| v.as_bool())
-                                        .unwrap_or(false);
+                                    let enc = handler::resolve_schema_encryption(
+                                        &table_name,
+                                        schema.get("encrypted").and_then(|v| v.as_bool()),
+                                    );
                                     let mut s = schema_state.borrow_mut();
                                     let ts = s.table(&table_name);
                                     ts.schema = Some(schema);
@@ -334,7 +338,7 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
                                 let mut s = schema_state.borrow_mut();
                                 let ts = s.table(&table_name);
                                 ts.schema = None;
-                                ts.encrypted = false;
+                                ts.encrypted = state::default_encrypted();
                                 eprintln!("jetcache: schema removed for {table_name}");
                             }
                         }
@@ -384,7 +388,7 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             let store = shared_store.clone();
             let op_name = op.to_string();
 
-            wasip3::spawn(async move {
+            wasip3::spawn_local(async move {
                 while let Ok(req) = ep_sub.next().await {
                     let msg_client = msg_client.clone();
                     let js = js.clone();
@@ -393,7 +397,7 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
                     let store = store.clone();
                     let op_str = op_name.clone();
 
-                    wasip3::spawn(async move {
+                    wasip3::spawn_local(async move {
                         handler::handle_service_request(
                             &msg_client,
                             &js,

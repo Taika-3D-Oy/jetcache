@@ -131,6 +131,9 @@ doc = {
                                 "NATS_CA_PEM": ca_pem,
                                 "NATS_CERT_PEM": cert_pem,
                                 "NATS_KEY_PEM": key_pem,
+                                # Encryption is on by default; local dev uses a
+                                # deterministic dev seed (never use in production).
+                                "LDB_DEV_SEED": "lattice-db-local-dev",
                             }
                         }
                     }

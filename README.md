@@ -60,8 +60,32 @@ Both modern `CACHE_*` and backward-compatible `LDB_*` environment variables are 
 | `CACHE_NATS_URL` | `NATS_URL` | (none) | NATS address for messaging and request/reply |
 | `CACHE_DATA_URL` | `NATS_DATA_URL` | (same as NATS_URL) | NATS address for storage (KV buckets) |
 | `CACHE_TCP_PORT` | `LDB_TCP_PORT` / `TCP_PORT` | `4080` | Localhost TCP loopback port for co-located components |
-| `CACHE_MASTER_KEY` | `LDB_MASTER_KEY` | (none) | Master key for AES-GCM encrypted tables |
-| `CACHE_DEV_SEED` | `LDB_DEV_SEED` | (none) | Deterministic dev key derivation seed |
+| `CACHE_MASTER_KEY` | `LDB_MASTER_KEY` | (none — required) | Master key for AES-256-GCM encryption at rest (hex or base64, 32+ bytes) |
+| `CACHE_DEV_SEED` | `LDB_DEV_SEED` | (none) | Deterministic dev key derivation seed (development only) |
+| `CACHE_ALLOW_PLAINTEXT` | `LDB_ALLOW_PLAINTEXT` | (none) | Set `1` to explicitly run without encryption (see below) |
+| `CACHE_MIGRATE_PLAINTEXT` | `LDB_MIGRATE_PLAINTEXT` | (none) | Set `1` temporarily to migrate pre-encryption data (see below) |
+
+### Encryption at rest
+
+Encryption (AES-256-GCM envelope encryption, per-table derived keys) is **on by
+default for every table** and is a deployment-level property:
+
+- The service **refuses to boot** without a master key (`CACHE_MASTER_KEY`,
+  or `CACHE_DEV_SEED` for development) unless you explicitly opt into
+  plaintext with `CACHE_ALLOW_PLAINTEXT=1`. This fails closed at startup
+  instead of silently storing unencrypted data.
+- A table may only opt out via `"encrypted": false` in its schema when the
+  service runs with `CACHE_ALLOW_PLAINTEXT=1`; otherwise the request is
+  rejected. Plaintext under a configured master key is treated as a
+  misconfiguration, not a feature.
+- **Strict store authentication**: a stored value that fails decryption is
+  always treated as corruption/tampering. Plaintext injected directly into the
+  backing NATS KV buckets by someone without the key is never accepted.
+- **Migrating pre-encryption data**: run temporarily with
+  `CACHE_MIGRATE_PLAINTEXT=1`. Legacy plaintext values are then readable and
+  are immediately re-encrypted back to KV when their table loads
+  (read-repair). While the flag is set, store authentication is weakened —
+  remove it once the logs show no remaining `legacy plaintext` messages.
 
 ### Rust Client
 

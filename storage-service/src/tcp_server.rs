@@ -42,7 +42,7 @@ pub fn start(
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    wasip3::spawn(async move {
+    wasip3::spawn_local(async move {
         if let Err(e) = run_listener(port, client, js, config, state, store).await {
             eprintln!("jetcache: tcp listener fatal: {e}");
         }

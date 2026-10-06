@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.0.0-rc.3] - 2026-10-06
+
+### Fixed
+
+- **Aligned async runtimes with nats-wasip3 1.0.0-rc.1**: storage-service now uses `wit-bindgen 0.62` / `wasip3 0.9` (was 0.57/0.7). The version mix loaded two independent wit-bindgen executors into one component; only the 0.57 queue was pumped, so nats-wasip3's background read/flush loops never ran and every post-connect request timed out ("meta KV setup: timeout" restart loop). Call sites migrated from `spawn` to `spawn_local`.
+
+## [Unreleased]
+
+### Security
+
+- **Encryption at rest is now ON by default for all tables** (breaking behavior change):
+  - The storage service resolves its encryption mode at startup and **fails closed**: without `JETCACHE_MASTER_KEY` / `CACHE_MASTER_KEY` / `LDB_MASTER_KEY` (or a `*_DEV_SEED` for development) it refuses to boot unless `*_ALLOW_PLAINTEXT=1` is explicitly set. Previously encryption was per-table opt-in via `"encrypted": true`, and a missing key surfaced only as a panic on the first encrypted request.
+  - Per-table `"encrypted": false` schema requests are **rejected** unless the service runs with `*_ALLOW_PLAINTEXT=1`; plaintext under a configured master key is treated as a misconfiguration. Schemas loaded from KV that request plaintext without the flag are corrected to encrypted with a loud warning.
+  - **Strict store authentication**: values in encrypted tables that fail decryption are always treated as corruption/tampering — plaintext written directly into the backing NATS KV buckets by a party without the key is never silently accepted.
+  - **Guarded legacy migration**: data written before encryption became the default is migrated only during an explicit, temporary window enabled with `*_MIGRATE_PLAINTEXT=1`. Legacy plaintext values are then readable and are immediately re-encrypted back to KV when their table loads (read-repair), so each value is accepted as plaintext at most once. Remove the flag once the logs show no remaining `legacy plaintext` messages.
+- `dev.sh`, `deploy/deploy-local.sh`, and the `deploy/workloaddeployment*.yaml` manifests now document/provision encryption keys (`LDB_DEV_SEED` for local development, commented `*_MASTER_KEY` for real deployments).
+
 ## [2.0.0-rc.2] - 2026-10-06
 
 ### Fixed

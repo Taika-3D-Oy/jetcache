@@ -7,6 +7,25 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Service-wide default for the per-table `encrypted` flag.
+///
+/// Encryption is on by default; the startup encryption-mode resolution flips
+/// this to `false` only when the service runs without a master key under an
+/// explicit `LDB_ALLOW_PLAINTEXT` opt-in.
+static DEFAULT_ENCRYPTED: AtomicBool = AtomicBool::new(true);
+
+/// Set the service-wide default for newly seen/schema-less tables.
+/// Called once during startup encryption-mode resolution.
+pub fn set_default_encrypted(value: bool) {
+    DEFAULT_ENCRYPTED.store(value, Ordering::Relaxed);
+}
+
+/// The encryption default applied to tables without an explicit schema flag.
+pub fn default_encrypted() -> bool {
+    DEFAULT_ENCRYPTED.load(Ordering::Relaxed)
+}
 
 /// A cached row: value bytes + NATS KV revision.
 ///
@@ -29,8 +48,10 @@ pub struct TableState {
     /// Optional JSON schema for validation on writes.
     pub schema: Option<serde_json::Value>,
     /// Whether values in this table are stored encrypted (AES-256-GCM envelope).
-    /// Derived from the schema `"encrypted": true` field and cached here so the
-    /// hot write/read paths avoid a JSON lookup on every operation.
+    /// Defaults to the service-wide [`default_encrypted`] (on, unless the
+    /// service runs in explicit plaintext mode); an explicit `"encrypted"`
+    /// field in the table schema overrides it. Cached here so the hot
+    /// write/read paths avoid a JSON lookup on every operation.
     pub encrypted: bool,
     /// Whether this table has been fully loaded from NATS KV.
     pub loaded: bool,
@@ -47,7 +68,7 @@ impl TableState {
         Self {
             data: HashMap::new(),
             schema: None,
-            encrypted: false,
+            encrypted: default_encrypted(),
             loaded: false,
             loading: false,
             watching: false,
@@ -96,7 +117,9 @@ impl State {
 
     /// Return true if the named table is marked encrypted.
     pub fn is_encrypted(&self, table: &str) -> bool {
-        self.tables.get(table).map_or(false, |t| t.encrypted)
+        self.tables
+            .get(table)
+            .map_or(default_encrypted(), |t| t.encrypted)
     }
 }
 
@@ -151,8 +174,15 @@ pub fn validate_schema(data: &[u8], schema: &serde_json::Value) -> Result<(), St
 
 #[cfg(test)]
 mod tests {
-    use super::validate_schema;
+    use super::{State, validate_schema};
     use serde_json::json;
+
+    #[test]
+    fn tables_default_to_encrypted() {
+        let state = State::new();
+        // Unknown tables follow the service-wide default (on).
+        assert!(state.is_encrypted("never-seen"));
+    }
 
     #[test]
     fn schema_without_fields_accepts_any_json_value() {

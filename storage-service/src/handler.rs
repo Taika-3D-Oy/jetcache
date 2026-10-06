@@ -60,15 +60,92 @@ const DEFAULT_CONSISTENCY_WATCHER_WAIT_STEPS: u32 = 2;
 /// Duration of each watcher polling interval.
 const DEFAULT_CONSISTENCY_WATCHER_WAIT_STEP_SECS: u64 = 1;
 
-// ── Master key (loaded once at startup) ─────────────────────────────────────
+// ── Master key & encryption mode ─────────────────────────────────────────────
 
 /// Global master key for AES-256-GCM envelope encryption.
-/// Populated on first encrypted write or read via `master_key()`.
+/// Populated once at startup by [`init_encryption_mode`].
 static MASTER_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 
-/// Return the master key, loading it on first call.
+/// Return the master key. Panics if [`init_encryption_mode`] did not run or
+/// the service is in plaintext mode — call sites must check the table's
+/// `encrypted` flag (which is only ever true when a key is configured).
 pub(crate) fn master_key() -> &'static [u8; 32] {
     MASTER_KEY.get_or_init(crate::vault::load_master_key)
+}
+
+/// True when a master key is configured and encryption can be performed.
+pub(crate) fn encryption_available() -> bool {
+    MASTER_KEY.get().is_some()
+}
+
+/// Resolve the service-wide encryption mode at startup. Fail closed: without
+/// a master key the service refuses to boot unless the operator explicitly
+/// opted into plaintext via `LDB_ALLOW_PLAINTEXT`.
+pub(crate) fn init_encryption_mode() -> Result<(), String> {
+    if let Some(key) = crate::vault::try_load_master_key() {
+        let _ = MASTER_KEY.set(key);
+        eprintln!(
+            "lattice-db: encryption at rest ENABLED (AES-256-GCM, default for all tables)"
+        );
+        if crate::vault::migration_permitted() {
+            eprintln!(
+                "lattice-db: WARNING — LDB_MIGRATE_PLAINTEXT is set: legacy plaintext values \
+                 will be accepted from the store and re-encrypted on load. Store \
+                 authentication is WEAKENED while this flag is set. Remove it once the \
+                 logs show no remaining legacy values."
+            );
+        }
+        return Ok(());
+    }
+    if crate::vault::plaintext_permitted() {
+        crate::state::set_default_encrypted(false);
+        eprintln!(
+            "lattice-db: WARNING — PLAINTEXT MODE: no master key configured and \
+             LDB_ALLOW_PLAINTEXT is set. ALL DATA IS STORED UNENCRYPTED. \
+             Do not use in production."
+        );
+        return Ok(());
+    }
+    Err(
+        "no master key configured and encryption is on by default. Set \
+         JETCACHE_MASTER_KEY / LDB_MASTER_KEY (production), JETCACHE_DEV_SEED / LDB_DEV_SEED \
+         (development only), or LDB_ALLOW_PLAINTEXT=1 to explicitly run unencrypted."
+            .to_string(),
+    )
+}
+
+/// Resolve the effective encryption flag for a schema's explicit `"encrypted"`
+/// value at schema-load/watch time (where rejecting is not an option).
+/// Policy violations are corrected with a loud warning: plaintext requests
+/// are ignored unless `LDB_ALLOW_PLAINTEXT` is set, and encryption requests
+/// degrade to plaintext only when no master key exists.
+pub(crate) fn resolve_schema_encryption(table: &str, explicit: Option<bool>) -> bool {
+    match explicit {
+        Some(false) => {
+            if crate::vault::plaintext_permitted() {
+                false
+            } else {
+                eprintln!(
+                    "lattice-db: WARNING — schema for '{table}' requests plaintext but \
+                     LDB_ALLOW_PLAINTEXT is not set; storing ENCRYPTED instead (existing \
+                     plaintext values require LDB_MIGRATE_PLAINTEXT=1 to migrate)"
+                );
+                true
+            }
+        }
+        Some(true) => {
+            if encryption_available() {
+                true
+            } else {
+                eprintln!(
+                    "lattice-db: WARNING — schema for '{table}' requests encryption but no \
+                     master key is configured; storing plaintext"
+                );
+                false
+            }
+        }
+        None => crate::state::default_encrypted(),
+    }
 }
 
 /// Encrypt `plaintext` if the table is marked encrypted; otherwise return a clone.
@@ -80,17 +157,61 @@ pub(crate) fn maybe_encrypt(table: &str, key: &str, plaintext: &[u8], encrypted:
     }
 }
 
-/// Decrypt `bytes` if the table is marked encrypted; otherwise return a clone.
-pub(crate) fn maybe_decrypt(
+/// Outcome of decrypting a value read from the backing store.
+pub(crate) enum StoredValue {
+    /// Authentic ciphertext (or the table is not encrypted).
+    Fresh(Vec<u8>),
+    /// Legacy pre-encryption plaintext. Only ever produced while
+    /// `LDB_MIGRATE_PLAINTEXT` is set; the caller should re-encrypt the value
+    /// back to KV so it is accepted as plaintext at most once.
+    LegacyPlaintext(Vec<u8>),
+}
+
+/// Tables already logged as containing legacy plaintext (log once per table).
+static LEGACY_LOGGED: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    OnceLock::new();
+
+fn log_legacy_once(table: &str, key: &str) {
+    let set = LEGACY_LOGGED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut set = set.lock().expect("legacy log set");
+    if set.insert(table.to_string()) {
+        eprintln!(
+            "lattice-db: legacy plaintext value(s) found in encrypted table '{table}' \
+             (first seen at key '{key}'); re-encrypting on load. Remove \
+             LDB_MIGRATE_PLAINTEXT when no further occurrences appear."
+        );
+    }
+}
+
+/// Decrypt a value read from the backing store.
+///
+/// Strict by default: for an encrypted table, any decryption failure —
+/// including non-envelope plaintext — is an error, so data injected directly
+/// into the store by someone without the key is never silently accepted.
+/// Only while `LDB_MIGRATE_PLAINTEXT` is set (a deliberate, temporary
+/// migration window) is a value that fails decryption and does not look like
+/// an envelope returned as [`StoredValue::LegacyPlaintext`]. A value that
+/// looks like an envelope but fails AEAD verification is always corruption/
+/// tampering and stays an error even during migration.
+pub(crate) fn decrypt_stored(
     table: &str,
     key: &str,
     bytes: Vec<u8>,
     encrypted: bool,
-) -> Result<Vec<u8>, String> {
-    if encrypted {
-        crate::vault::decrypt(master_key(), table, key, &bytes)
-    } else {
-        Ok(bytes)
+) -> Result<StoredValue, String> {
+    if !encrypted {
+        return Ok(StoredValue::Fresh(bytes));
+    }
+    match crate::vault::decrypt(master_key(), table, key, &bytes) {
+        Ok(plaintext) => Ok(StoredValue::Fresh(plaintext)),
+        Err(e) => {
+            if crate::vault::migration_permitted() && !crate::vault::looks_like_envelope(&bytes) {
+                log_legacy_once(table, key);
+                Ok(StoredValue::LegacyPlaintext(bytes))
+            } else {
+                Err(e)
+            }
+        }
     }
 }
 
@@ -555,7 +676,7 @@ async fn ensure_loaded(
         state.borrow_mut().table(table).watching = true;
         let watch_state = state.clone();
         let table_name = table.to_string();
-        wasip3::spawn(async move {
+        wasip3::spawn_local(async move {
             run_table_watcher(kv, &table_name, &watch_state, max_rev).await;
         });
         return Ok(());
@@ -596,9 +717,14 @@ async fn ensure_loaded(
     let mut s = state.borrow_mut();
     let ts = s.table(table);
     let encrypted = ts.encrypted;
+    let mut legacy_repairs: Vec<(String, Vec<u8>)> = Vec::new();
     for (key, value, revision) in entries {
-        let plaintext = match maybe_decrypt(table, &key, value, encrypted) {
-            Ok(p) => p,
+        let plaintext = match decrypt_stored(table, &key, value, encrypted) {
+            Ok(StoredValue::Fresh(p)) => p,
+            Ok(StoredValue::LegacyPlaintext(p)) => {
+                legacy_repairs.push((key.clone(), p.clone()));
+                p
+            }
             Err(e) => {
                 eprintln!("lattice-db: decrypt failed loading {table}:{key}: {e}");
                 continue;
@@ -612,11 +738,20 @@ async fn ensure_loaded(
     let max_rev = snapshot_last_seq;
     drop(s);
 
+    // Read-repair: re-encrypt legacy plaintext values back to KV (migration
+    // mode only) so each value is accepted as plaintext at most once.
+    for (key, plaintext) in legacy_repairs {
+        let envelope = crate::vault::encrypt(master_key(), table, &key, &plaintext);
+        if let Err(e) = kv.put(&key, &envelope).await {
+            eprintln!("lattice-db: legacy re-encrypt failed for {table}:{key}: {e}");
+        }
+    }
+
     if needs_watcher {
         state.borrow_mut().table(table).watching = true;
         let watch_state = state.clone();
         let table_name = table.to_string();
-        wasip3::spawn(async move {
+        wasip3::spawn_local(async move {
             run_table_watcher(kv, &table_name, &watch_state, max_rev).await;
         });
     }
@@ -659,22 +794,38 @@ async fn reload_table_from_kv(
         .map_err(|e| format!("load table: {e}"))?;
     let (entries, snapshot_last_seq) = load_table_snapshot(&kv).await?;
 
-    let mut s = state.borrow_mut();
-    let ts = s.table(table);
-    ts.data.clear();
-    let encrypted = ts.encrypted;
-    for (key, value, revision) in entries {
-        let plaintext = match maybe_decrypt(table, &key, value, encrypted) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("lattice-db: decrypt failed reloading {table}:{key}: {e}");
-                continue;
-            }
-        };
-        ts.upsert(&key, plaintext, revision);
+    let mut legacy_repairs: Vec<(String, Vec<u8>)> = Vec::new();
+    {
+        let mut s = state.borrow_mut();
+        let ts = s.table(table);
+        ts.data.clear();
+        let encrypted = ts.encrypted;
+        for (key, value, revision) in entries {
+            let plaintext = match decrypt_stored(table, &key, value, encrypted) {
+                Ok(StoredValue::Fresh(p)) => p,
+                Ok(StoredValue::LegacyPlaintext(p)) => {
+                    legacy_repairs.push((key.clone(), p.clone()));
+                    p
+                }
+                Err(e) => {
+                    eprintln!("lattice-db: decrypt failed reloading {table}:{key}: {e}");
+                    continue;
+                }
+            };
+            ts.upsert(&key, plaintext, revision);
+        }
+        ts.loaded = true;
+        ts.note_applied_revision(snapshot_last_seq);
     }
-    ts.loaded = true;
-    ts.note_applied_revision(snapshot_last_seq);
+
+    // Read-repair: re-encrypt legacy plaintext values back to KV (migration
+    // mode only) so each value is accepted as plaintext at most once.
+    for (key, plaintext) in legacy_repairs {
+        let envelope = crate::vault::encrypt(master_key(), table, &key, &plaintext);
+        if let Err(e) = kv.put(&key, &envelope).await {
+            eprintln!("lattice-db: legacy re-encrypt failed for {table}:{key}: {e}");
+        }
+    }
     Ok(snapshot_last_seq)
 }
 
@@ -828,8 +979,12 @@ async fn run_table_watcher(
                     .map_or(false, |r| r.revision >= entry.revision);
                 if !dominated {
                     let plaintext = if ts.encrypted {
-                        match crate::vault::decrypt(master_key(), table, &entry.key, &entry.value) {
-                            Ok(p) => p,
+                        match decrypt_stored(table, &entry.key, entry.value, true) {
+                            Ok(StoredValue::Fresh(p)) => p,
+                            // Migration mode only: accept legacy plaintext from
+                            // older replicas mid-upgrade; it is re-encrypted on
+                            // the next table load.
+                            Ok(StoredValue::LegacyPlaintext(p)) => p,
                             Err(e) => {
                                 eprintln!(
                                     "lattice-db: watcher decrypt failed {table}:{}: {e}",
@@ -1119,21 +1274,17 @@ pub(crate) async fn handle_cas(
         Ok(r) => r,
         Err(e) => {
             if let Ok(Some(current)) = kv.get(&req.key).await {
-                let plaintext = if encrypted {
-                    match crate::vault::decrypt(master_key(), &req.table, &req.key, &current.value)
-                    {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!(
-                                "lattice-db: cas fallback decrypt failed {table}:{key}: {e}",
-                                table = req.table,
-                                key = req.key
-                            );
-                            return Err(format!("{e}"));
-                        }
+                let plaintext = match decrypt_stored(&req.table, &req.key, current.value, encrypted)
+                {
+                    Ok(StoredValue::Fresh(p)) | Ok(StoredValue::LegacyPlaintext(p)) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "lattice-db: cas fallback decrypt failed {table}:{key}: {e}",
+                            table = req.table,
+                            key = req.key
+                        );
+                        return Err(format!("{e}"));
                     }
-                } else {
-                    current.value
                 };
                 state
                     .borrow_mut()
@@ -1420,6 +1571,46 @@ pub(crate) async fn handle_schema_set(
             return Err("schema.fields must be an object".into());
         }
     }
+    let explicit_encrypted = req.schema.get("encrypted").and_then(|v| v.as_bool());
+    let encrypted = match explicit_encrypted {
+        Some(false) => {
+            // Per-table plaintext is almost certainly a misconfiguration when
+            // encryption is on by default — require the operator's explicit
+            // deployment-level opt-in.
+            if !crate::vault::plaintext_permitted() {
+                return Err(format!(
+                    "refusing to store table '{}' unencrypted: encryption is on by default; \
+                     set LDB_ALLOW_PLAINTEXT=1 on the storage service to permit plaintext",
+                    req.table
+                ));
+            }
+            if encryption_available() {
+                eprintln!(
+                    "lattice-db: WARNING — table '{}' will store PLAINTEXT while a master key \
+                     IS configured; this is almost certainly unintended",
+                    req.table
+                );
+            } else {
+                eprintln!(
+                    "lattice-db: WARNING — table '{}' will store PLAINTEXT (LDB_ALLOW_PLAINTEXT is set)",
+                    req.table
+                );
+            }
+            false
+        }
+        Some(true) => {
+            if !encryption_available() {
+                return Err(format!(
+                    "cannot enable encryption for table '{}': the storage service has no \
+                     master key configured (running under LDB_ALLOW_PLAINTEXT)",
+                    req.table
+                ));
+            }
+            true
+        }
+        None => crate::state::default_encrypted(),
+    };
+
     let kv = crate::store::get_or_create_kv(store, "_schemas")
         .await
         .map_err(|e| format!("{e}"))?;
@@ -1429,11 +1620,7 @@ pub(crate) async fn handle_schema_set(
         .map_err(|e| format!("{e}"))?;
 
     state.borrow_mut().table(&req.table).schema = Some(req.schema.clone());
-    state.borrow_mut().table(&req.table).encrypted = req
-        .schema
-        .get("encrypted")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    state.borrow_mut().table(&req.table).encrypted = encrypted;
     ok_json(&EmptyResp {})
 }
 

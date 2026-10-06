@@ -83,6 +83,8 @@ sed "s/__NATS_URL__/${NATS_IP}:4222/" deploy/workloaddeployment.yaml | kubectl a
 
 *Note: Ensure your `deploy/workloaddeployment.yaml` specifies the `sockets ── tcp` interface, but omits the `cli ── environment` interface, as the `wasip3` host handles environment variable provisioning implicitly via config.*
 
+*Encryption note: the storage service refuses to boot without a master key (encryption is on by default). For test clusters, uncomment `LDB_DEV_SEED` in `deploy/workloaddeployment.yaml` (or set `LDB_MASTER_KEY`). `deploy/deploy-local.sh` already injects a dev seed automatically. Without a key the workload will crash-loop with a "no master key configured" error — that fail-closed behavior is intentional.*
+
 ## 5. Run the Integration Tests
 
 Finally, expose the NATS cluster locally and run the integration test suite.

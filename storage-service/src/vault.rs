@@ -5,11 +5,9 @@
 //! - **Master key**: 32-byte key loaded from the `LDB_MASTER_KEY` environment
 //!   variable (hex or base64, 32+ bytes).  In development set `LDB_DEV_SEED`
 //!   instead; a deterministic key is derived via HKDF so restarts are idempotent.
-//!   If neither is set and `LDB_ENCRYPTION_MODE != off`, the process panics on
-//!   first use so misconfiguration is caught at startup.
 //!
 //! - **Per-table DEK**: derived from the master key with HKDF-SHA256 keyed on
-//!   `"lattice-db-dek:{table_name}"`.  Rotating the master key invalidates all
+//!   `"table:{table_name}"`.  Rotating the master key invalidates all
 //!   tables simultaneously; rotating per-table requires re-encrypting one bucket.
 //!
 //! - **Envelope format** (bytes stored in NATS KV):
@@ -18,11 +16,28 @@
 //! - **AAD**: `"{table_name}:{key}"` — binds the ciphertext to its KV location.
 //!   Copying a ciphertext to a different key or table fails decryption.
 //!
-//! ## Opt-in
+//! ## Default-on
 //!
-//! Encryption is per-table.  A table is encrypted when its schema contains
-//! `"encrypted": true`.  Tables without this flag (or with no schema) are stored
-//! and retrieved as plaintext even when a master key is configured.
+//! Encryption is **on by default for every table**.  The service refuses to
+//! boot without a master key unless the operator explicitly opts into plaintext
+//! by setting `LDB_ALLOW_PLAINTEXT=1` (or `true`/`yes`).  When plaintext is
+//! permitted, an individual table may opt out via `"encrypted": false` in its
+//! schema; without `LDB_ALLOW_PLAINTEXT` such schemas are rejected.
+//!
+//! ## Strict store authentication & migration
+//!
+//! A value stored in an encrypted table that fails decryption is **always**
+//! treated as corruption or tampering — plaintext is never silently accepted
+//! from the backing store, because that would let anyone with direct write
+//! access to the NATS KV buckets (but no key) forge data the service trusts.
+//!
+//! Data written before encryption became the default ("legacy plaintext") is
+//! migrated only during an explicit, temporary migration window enabled with
+//! `LDB_MIGRATE_PLAINTEXT=1`.  While active, values that fail decryption and
+//! do not [`looks_like_envelope`] are read as legacy plaintext and immediately
+//! re-encrypted back to KV (read-repair at table-load time), so each value is
+//! accepted as plaintext at most once.  Remove the flag when the logs show no
+//! remaining legacy values.
 
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
@@ -40,15 +55,31 @@ const MIN_ENVELOPE_LEN: usize = 1 + NONCE_LEN + 16;
 
 // ── Master key loading ────────────────────────────────────────────────────────
 
-/// Load and return the master key, or panic if misconfigured.
+/// First set value among equivalent env var aliases.
+fn env_any(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| std::env::var(k).ok())
+}
+
+/// Load and return the master key, or panic if none is configured.
 ///
 /// Caching is intentionally left to the caller (call once at startup).
 pub fn load_master_key() -> [u8; 32] {
+    try_load_master_key().expect(
+        "no master key is configured. Set JETCACHE_MASTER_KEY / LDB_MASTER_KEY (production) or \
+         JETCACHE_DEV_SEED / LDB_DEV_SEED (development only), or set LDB_ALLOW_PLAINTEXT=1 to \
+         explicitly run without encryption.",
+    )
+}
+
+/// Load the master key if one is configured.
+///
+/// Returns `None` when no key/seed env var is set.  Panics when a master key
+/// is set but malformed or too short — a malformed key is always an operator
+/// error, never a reason to fall back to plaintext.
+pub fn try_load_master_key() -> Option<[u8; 32]> {
     // Production path: JETCACHE_MASTER_KEY / CACHE_MASTER_KEY / LDB_MASTER_KEY as hex or base64, must be 32+ bytes.
-    let master_env = std::env::var("JETCACHE_MASTER_KEY")
-        .or_else(|_| std::env::var("CACHE_MASTER_KEY"))
-        .or_else(|_| std::env::var("LDB_MASTER_KEY"));
-    if let Ok(raw) = master_env {
+    let master_env = env_any(&["JETCACHE_MASTER_KEY", "CACHE_MASTER_KEY", "LDB_MASTER_KEY"]);
+    if let Some(raw) = master_env {
         let raw = raw.trim().to_string();
         // Try hex first, then base64.
         let bytes = if raw.len() >= 64 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -67,26 +98,59 @@ pub fn load_master_key() -> [u8; 32] {
         }
         let mut key = [0u8; 32];
         key.copy_from_slice(&bytes[..32]);
-        return key;
+        return Some(key);
     }
 
     // Dev path: JETCACHE_DEV_SEED / CACHE_DEV_SEED / LDB_DEV_SEED — deterministic HKDF-derived key.
-    let dev_seed_env = std::env::var("JETCACHE_DEV_SEED")
-        .or_else(|_| std::env::var("CACHE_DEV_SEED"))
-        .or_else(|_| std::env::var("LDB_DEV_SEED"));
-    if let Ok(seed) = dev_seed_env {
+    let dev_seed_env = env_any(&["JETCACHE_DEV_SEED", "CACHE_DEV_SEED", "LDB_DEV_SEED"]);
+    if let Some(seed) = dev_seed_env {
         eprintln!(
             "jetcache: WARNING — using JETCACHE_DEV_SEED / CACHE_DEV_SEED / LDB_DEV_SEED for encryption. \
              Never use this in production. Set JETCACHE_MASTER_KEY instead."
         );
-        return derive_dev_key(&seed);
+        return Some(derive_dev_key(&seed));
     }
 
-    // Neither set: fail fast.
-    panic!(
-        "jetcache: encryption is enabled for one or more tables but no master key is \
-         configured. Set JETCACHE_MASTER_KEY (production) or JETCACHE_DEV_SEED (development only)."
-    );
+    None
+}
+
+/// True when the named plaintext-permission env var (any alias) is set to a
+/// truthy value (`1`, `true`, `yes`).
+fn flag_permitted(keys: &[&str]) -> bool {
+    env_any(keys)
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// True when the operator has explicitly opted into plaintext storage.
+pub fn plaintext_permitted() -> bool {
+    flag_permitted(&[
+        "JETCACHE_ALLOW_PLAINTEXT",
+        "CACHE_ALLOW_PLAINTEXT",
+        "LDB_ALLOW_PLAINTEXT",
+    ])
+}
+
+/// True when the operator has explicitly enabled the legacy-plaintext
+/// migration window.  While active, pre-encryption plaintext values in
+/// encrypted tables are readable and re-encrypted back to KV on load.  This
+/// weakens store authentication (see module docs) and must only be set
+/// temporarily during a migration.
+pub fn migration_permitted() -> bool {
+    flag_permitted(&[
+        "JETCACHE_MIGRATE_PLAINTEXT",
+        "CACHE_MIGRATE_PLAINTEXT",
+        "LDB_MIGRATE_PLAINTEXT",
+    ])
+}
+
+/// True when `bytes` has the shape of an envelope produced by [`encrypt`]
+/// (version byte + minimum length).  Used to distinguish legacy plaintext
+/// values from real ciphertext on the read path; a value that looks like an
+/// envelope but fails AEAD verification is treated as corruption/tampering,
+/// never as plaintext.
+pub fn looks_like_envelope(bytes: &[u8]) -> bool {
+    bytes.len() >= MIN_ENVELOPE_LEN && bytes[0] == VERSION
 }
 
 fn derive_dev_key(seed: &str) -> [u8; 32] {
@@ -294,5 +358,20 @@ mod tests {
         let k1 = derive_dev_key("my-seed");
         let k2 = derive_dev_key("my-seed");
         assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn envelope_detection() {
+        let master = test_master();
+        let nonce = [7u8; 12];
+        let envelope = encrypt_with_nonce(&master, "users", "user-1", b"secret", &nonce);
+        assert!(looks_like_envelope(&envelope));
+
+        // Typical plaintext values are not envelopes.
+        assert!(!looks_like_envelope(b""));
+        assert!(!looks_like_envelope(b"short"));
+        assert!(!looks_like_envelope(
+            b"{\"a\":\"json-object-long-enough-to-exceed-min-envelope-len\"}"
+        ));
     }
 }

@@ -26,6 +26,17 @@ spec:
               LDB_DATA_INSTANCE: "__LDB_DATA_INSTANCE__"
               LDB_CONSISTENCY_WATCHER_WAIT_STEPS: "2"
               LDB_CONSISTENCY_WATCHER_WAIT_STEP_SECS: "1"
+              # Encryption at rest is ON by default — the service refuses to
+              # boot without a master key. Provide a 32+ byte key (hex or
+              # base64), e.g. templated from a Secret by your deploy tooling:
+              # LDB_MASTER_KEY: "__LDB_MASTER_KEY__"
+              # Development-only alternative (deterministic key, NOT for production):
+              # LDB_DEV_SEED: "change-me"
+              # Emergency escape hatch: run fully unencrypted (NOT recommended):
+              # LDB_ALLOW_PLAINTEXT: "1"
+              # Temporary migration window for data written before encryption
+              # became the default (remove once logs show no legacy values):
+              # LDB_MIGRATE_PLAINTEXT: "1"
       hostInterfaces:
         # The service needs outgoing TCP to connect to NATS.
         - namespace: wasi

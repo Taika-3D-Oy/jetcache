@@ -1,6 +1,6 @@
 [package]
 name = "jetcache-client"
-version = "2.0.0-rc.2"
+version = "2.0.0-rc.3"
 edition = "2021"
 description = "Typed Rust client SDK for jetcache (in-memory read-through cache backed by NATS JetStream KV)"
 license = "Apache-2.0"
