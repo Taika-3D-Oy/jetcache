@@ -65,7 +65,7 @@ echo "    nats req ldb.get '{\"table\":\"test\",\"key\":\"k1\"}'"
 echo ""
 
 exec wasmtime run \
-  --inherit-network \
+  -S inherit-network=y \
   --env NATS_URL=127.0.0.1:${NATS_PORT} \
   --env LDB_DEV_SEED=lattice-db-local-dev \
-  target/wasm32-wasip2/debug/storage-service.wasm
+  target/wasm32-wasip2/debug/storage_service.wasm
