@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.0.0-rc.2] - 2026-10-06
+
+### Fixed
+
+- **Schema validation no longer applies to encryption-only schemas**: `validate_schema` returns early when the schema declares no `fields` map, so `"encrypted": true` alone does not impose a JSON-object-only constraint on values (forward-port of the v1.11.2 fix).
+
 ## [2.0.0-rc.1] - 2026-09-24
 
 ### Major Architecture & Rebranding
