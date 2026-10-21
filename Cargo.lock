@@ -319,9 +319,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "nats-wasip3"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02961a470d2c2400c37b8f4971590ba056ca46a5326c996f67f9cb1f9964854b"
+checksum = "0c2b8e6df9183c74750b75315f4419f046fed3a0c6776a8add1ad37a5391532a"
 dependencies = [
  "base64",
  "futures",
@@ -452,7 +452,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "storage-service"
-version = "2.0.0-rc.3"
+version = "2.0.0-rc.4"
 dependencies = [
  "aes-gcm",
  "base64",

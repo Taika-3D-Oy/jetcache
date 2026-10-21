@@ -71,17 +71,16 @@ spec:
       targetPort: 4222
       name: client
 ---
-# NodePort service for host-machine access (testing from outside the cluster).
+# ClusterIP service (use `kubectl port-forward svc/nats 4222:4222` for local host access).
 apiVersion: v1
 kind: Service
 metadata:
   name: nats-external
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: nats
   ports:
     - port: 4222
       targetPort: 4222
-      nodePort: 30422
       name: client

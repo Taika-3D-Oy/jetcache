@@ -31,8 +31,6 @@ impl wasip3::exports::cli::run::Guest for Component {
     }
 }
 
-
-
 fn get_env_opt(keys: &[&str]) -> Option<String> {
     for k in keys {
         if let Ok(v) = std::env::var(k) {
@@ -45,7 +43,12 @@ fn get_env_opt(keys: &[&str]) -> Option<String> {
     None
 }
 
-fn build_connect_config(address: String, name: &str, use_tls: bool, is_data: bool) -> ConnectConfig {
+fn build_connect_config(
+    address: String,
+    name: &str,
+    use_tls: bool,
+    is_data: bool,
+) -> ConnectConfig {
     let user = if is_data {
         get_env_opt(&["NATS_DATA_USER", "NATS_USER"])
     } else {
@@ -53,15 +56,35 @@ fn build_connect_config(address: String, name: &str, use_tls: bool, is_data: boo
     };
 
     let pass = if is_data {
-        get_env_opt(&["NATS_DATA_PASSWORD", "NATS_PASSWORD", "NATS_DATA_PASS", "NATS_PASS"])
+        get_env_opt(&[
+            "NATS_DATA_PASSWORD",
+            "NATS_PASSWORD",
+            "NATS_DATA_PASS",
+            "NATS_PASS",
+        ])
     } else {
-        get_env_opt(&["NATS_MSG_PASSWORD", "NATS_PASSWORD", "NATS_MSG_PASS", "NATS_PASS"])
+        get_env_opt(&[
+            "NATS_MSG_PASSWORD",
+            "NATS_PASSWORD",
+            "NATS_MSG_PASS",
+            "NATS_PASS",
+        ])
     };
 
     let auth_token = if is_data {
-        get_env_opt(&["NATS_DATA_AUTH_TOKEN", "NATS_AUTH_TOKEN", "NATS_DATA_TOKEN", "NATS_TOKEN"])
+        get_env_opt(&[
+            "NATS_DATA_AUTH_TOKEN",
+            "NATS_AUTH_TOKEN",
+            "NATS_DATA_TOKEN",
+            "NATS_TOKEN",
+        ])
     } else {
-        get_env_opt(&["NATS_MSG_AUTH_TOKEN", "NATS_AUTH_TOKEN", "NATS_MSG_TOKEN", "NATS_TOKEN"])
+        get_env_opt(&[
+            "NATS_MSG_AUTH_TOKEN",
+            "NATS_AUTH_TOKEN",
+            "NATS_MSG_TOKEN",
+            "NATS_TOKEN",
+        ])
     };
 
     let jwt = if is_data {
@@ -82,7 +105,6 @@ fn build_connect_config(address: String, name: &str, use_tls: bool, is_data: boo
     }
 }
 
-
 async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     // Resolve encryption mode first — fail closed before touching the network
     // if no master key is configured and plaintext was not explicitly allowed.
@@ -93,14 +115,24 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| std::env::args().nth(1));
     let nats_data_url = get_env_opt(&["JETCACHE_DATA_URL", "CACHE_DATA_URL", "NATS_DATA_URL"]);
     let tcp_port = Some(
-        get_env_opt(&["JETCACHE_TCP_PORT", "CACHE_TCP_PORT", "LDB_TCP_PORT", "JETCACHE_PORT", "CACHE_PORT", "TCP_PORT"])
-            .and_then(|v| v.parse::<u16>().ok())
-            .unwrap_or(4080),
+        get_env_opt(&[
+            "JETCACHE_TCP_PORT",
+            "CACHE_TCP_PORT",
+            "LDB_TCP_PORT",
+            "JETCACHE_PORT",
+            "CACHE_PORT",
+            "TCP_PORT",
+        ])
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(4080),
     );
 
     // At least one of NATS messaging or TCP must be enabled.
     if nats_url.is_none() && tcp_port.is_none() {
-        return Err("at least one of NATS_URL or JETCACHE_TCP_PORT/CACHE_TCP_PORT/LDB_TCP_PORT must be set".into());
+        return Err(
+            "at least one of NATS_URL or JETCACHE_TCP_PORT/CACHE_TCP_PORT/LDB_TCP_PORT must be set"
+                .into(),
+        );
     }
 
     // Data connection (JetStream KV) — required for persistence.
@@ -112,7 +144,8 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     // TLS: enabled if NATS_TLS=1 is set.
     // Note: wasip3 uses host-side TLS via wasi:tls — no in-wasm crypto.
     // Custom CA certs are not yet supported by wasi:tls hosts.
-    let use_tls = get_env_opt(&["JETCACHE_TLS", "CACHE_TLS", "NATS_TLS"]).map_or(false, |v| v == "1" || v == "true");
+    let use_tls = get_env_opt(&["JETCACHE_TLS", "CACHE_TLS", "NATS_TLS"])
+        .map_or(false, |v| v == "1" || v == "true");
 
     if use_tls {
         log_info!("TLS enabled (host-side wasi:tls)");
@@ -157,13 +190,19 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
 
     // Instance names: drive NATS subject and KV bucket prefixes.
     let instance = {
-        let raw = get_env_opt(&["JETCACHE_INSTANCE", "CACHE_INSTANCE", "LDB_INSTANCE"]).unwrap_or_else(|| "lid".to_string());
+        let raw = get_env_opt(&["JETCACHE_INSTANCE", "CACHE_INSTANCE", "LDB_INSTANCE"])
+            .unwrap_or_else(|| "lid".to_string());
         validate_instance_name("JETCACHE_INSTANCE", &raw)?;
         eprintln!("jetcache: instance (messaging) = {raw}");
         raw
     };
     let data_instance = {
-        let raw = get_env_opt(&["JETCACHE_DATA_INSTANCE", "CACHE_DATA_INSTANCE", "LDB_DATA_INSTANCE"]).unwrap_or_else(|| instance.clone());
+        let raw = get_env_opt(&[
+            "JETCACHE_DATA_INSTANCE",
+            "CACHE_DATA_INSTANCE",
+            "LDB_DATA_INSTANCE",
+        ])
+        .unwrap_or_else(|| instance.clone());
         validate_instance_name("JETCACHE_DATA_INSTANCE", &raw)?;
         eprintln!("jetcache: instance (data) = {raw}");
         raw
@@ -183,7 +222,8 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     // writes a fresh epoch on startup; a KV watcher ensures all replicas
     // converge to the latest epoch. After a data restore (or wipe) the next
     // startup naturally rotates the epoch, invalidating stale cookies.
-    let meta_kv = store::get_or_create_kv(&shared_store, "_meta").await
+    let meta_kv = store::get_or_create_kv(&shared_store, "_meta")
+        .await
         .map_err(|e| format!("meta KV setup: {e}"))?;
     {
         let bytes = wasip3::random::random::get_random_bytes(8);
@@ -207,8 +247,7 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(w) => w,
                     Err(e) => {
                         eprintln!("lattice-db: _meta watcher setup failed: {e} — retrying");
-                        wasip3::clocks::monotonic_clock::wait_for(nats_wasi::client::secs(5))
-                            .await;
+                        wasip3::clocks::monotonic_clock::wait_for(nats_wasi::client::secs(5)).await;
                         continue;
                     }
                 };
@@ -216,9 +255,7 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
                     let entry = match watcher.next().await {
                         Ok(e) => e,
                         Err(e) => {
-                            eprintln!(
-                                "lattice-db: _meta watcher disconnected: {e} — reconnecting"
-                            );
+                            eprintln!("lattice-db: _meta watcher disconnected: {e} — reconnecting");
                             break;
                         }
                     };
@@ -252,7 +289,6 @@ async fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             shared_store.clone(),
         );
     }
-
 
     // Load persisted schemas from KV.
     {

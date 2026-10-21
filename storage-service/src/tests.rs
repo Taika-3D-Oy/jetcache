@@ -250,4 +250,32 @@ mod tests {
         assert!(output.contains("\\r"));
         assert!(output.contains("\\t"));
     }
+
+    #[test]
+    fn test_validate_table_name_rejects_injection() {
+        assert!(crate::handler::validate_table_name("users").is_ok());
+        assert!(crate::handler::validate_table_name("user_events-v2").is_ok());
+        assert!(crate::handler::validate_table_name("_sql_catalog").is_ok());
+        assert!(crate::handler::validate_table_name("").is_err());
+        assert!(crate::handler::validate_table_name("users.admin").is_err());
+        assert!(crate::handler::validate_table_name("users.*").is_err());
+        assert!(crate::handler::validate_table_name("users>").is_err());
+        assert!(crate::handler::validate_table_name("users\r\nPUB").is_err());
+    }
+
+    #[test]
+    fn test_validate_key_name_rejects_wildcards_and_bad_tokens() {
+        assert!(crate::handler::validate_key_name("user:101").is_ok());
+        assert!(crate::handler::validate_key_name("org.team.user:101").is_ok());
+        assert!(crate::handler::validate_key_name("").is_err());
+        assert!(crate::handler::validate_key_name("*").is_err());
+        assert!(crate::handler::validate_key_name(">").is_err());
+        assert!(crate::handler::validate_key_name("user.*").is_err());
+        assert!(crate::handler::validate_key_name("user.>").is_err());
+        assert!(crate::handler::validate_key_name(".leading").is_err());
+        assert!(crate::handler::validate_key_name("trailing.").is_err());
+        assert!(crate::handler::validate_key_name("a..b").is_err());
+        assert!(crate::handler::validate_key_name("has space").is_err());
+        assert!(crate::handler::validate_key_name("has\r\ncrlf").is_err());
+    }
 }

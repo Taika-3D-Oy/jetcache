@@ -174,7 +174,7 @@ pub fn validate_schema(data: &[u8], schema: &serde_json::Value) -> Result<(), St
 
 #[cfg(test)]
 mod tests {
-    use super::{State, validate_schema};
+    use super::{validate_schema, State};
     use serde_json::json;
 
     #[test]

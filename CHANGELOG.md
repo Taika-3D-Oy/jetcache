@@ -1,5 +1,31 @@
 # Changelog
 
+## [2.0.0-rc.4] - 2026-10-21
+
+### Security
+
+- **Table & Key Identifier Validation**:
+  - Enforced strict ASCII alphanumeric/`_`/`-` validation on table names (`validate_table_name`) and subject-token safety on key names (`validate_key_name`, rejecting wildcards `*`/`>`, leading/trailing/consecutive dots, whitespace, and control characters) across all read, write, list, prefix, and schema endpoints.
+- **Pre-Parse Payload Ceiling**:
+  - Enforced an 8 MiB `MAX_RAW_PAYLOAD_BYTES` limit in `dispatch_operation` before JSON deserialization.
+- **Constant-Time Token Comparison (`ct_eq`)**:
+  - Hashed both inputs with SHA-256 before constant-time comparison so neither prefix nor token length leaks via timing.
+- **Encrypted Cache Integrity on `cas_delete` Conflict**:
+  - Decrypted fallback KV values before updating the in-memory cache when `cas_delete` encounters a revision mismatch, preventing raw ciphertext envelopes from being cached.
+- **TCP Server Concurrency & Read/Write Timeouts**:
+  - Dispatched accepted TCP connections concurrently via `wasip3::spawn_local` and enforced 5-second timeouts on frame length-prefix reads, payload reads, and response writes.
+- **Local Deployment Hardening**:
+  - Changed `nats-external` service in `deploy/nats.yaml` from `NodePort` to `ClusterIP` and set `umask 077` in `deploy/deploy-local.sh`.
+
+### Fixed
+
+- **Concurrent Table Load & Watcher Race (`ensure_loaded`)**:
+  - Waited for in-progress table loads to complete and verified both `loaded` and `watching` states before returning or spawning the background KV watcher.
+
+### Dependencies
+
+- Upgraded `nats-wasip3` to `1.0.0-rc.2`.
+
 ## [2.0.0-rc.3] - 2026-10-06
 
 ### Security

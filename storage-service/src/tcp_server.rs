@@ -83,7 +83,9 @@ async fn run_listener(
                     let cfg = config.clone();
                     let st = state.clone();
                     let sto = store.clone();
-                    handle_connection(conn, client, js, cfg, st, sto).await;
+                    wasip3::spawn_local(async move {
+                        handle_connection(conn, client, js, cfg, st, sto).await;
+                    });
                 }
             }
             StreamResult::Dropped | StreamResult::Cancelled => {
@@ -105,12 +107,21 @@ async fn handle_connection(
     let (mut rx, _rx_done) = conn.receive();
 
     let mut buf = Vec::new();
+    let read_timeout = nats_wasi::client::secs(5);
 
-    // Read 4-byte length prefix.
+    // Read 4-byte length prefix with timeout.
     while buf.len() < 4 {
-        if stream_read_u8(&mut rx, &mut buf).await == 0 {
-            eprintln!("lattice-db: tcp connection closed before 4-byte length prefix");
-            return;
+        match nats_wasi::client::with_timeout(read_timeout, stream_read_u8(&mut rx, &mut buf)).await
+        {
+            Ok(0) => {
+                eprintln!("lattice-db: tcp connection closed before 4-byte length prefix");
+                return;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("lattice-db: tcp connection timed out waiting for length prefix");
+                return;
+            }
         }
     }
     let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
@@ -121,11 +132,19 @@ async fn handle_connection(
         return;
     }
 
-    // Read full payload.
+    // Read full payload with timeout.
     while buf.len() < len {
-        if stream_read_u8(&mut rx, &mut buf).await == 0 {
-            eprintln!("lattice-db: tcp connection closed mid-payload");
-            return;
+        match nats_wasi::client::with_timeout(read_timeout, stream_read_u8(&mut rx, &mut buf)).await
+        {
+            Ok(0) => {
+                eprintln!("lattice-db: tcp connection closed mid-payload");
+                return;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("lattice-db: tcp connection timed out reading payload");
+                return;
+            }
         }
     }
     let frame: Vec<u8> = buf.drain(..len).collect();
@@ -141,17 +160,14 @@ async fn handle_connection(
     out_frame.extend_from_slice(&resp_bytes);
 
     let (mut tx, tx_rx) = wit_stream::new::<u8>();
-    let _send_fut = conn.send(tx_rx);
-    std::mem::forget(_send_fut);
+    let send_fut = conn.send(tx_rx);
 
     tx.write_all(out_frame).await;
     drop(tx);
+    let _ = nats_wasi::client::with_timeout(read_timeout, async { send_fut.await }).await;
     drop(rx);
     drop(_rx_done);
     drop(conn);
-
-    // Yield to the WASI host event loop to flush the send stream to the OS socket.
-    wasip3::clocks::monotonic_clock::wait_for(1_000_000).await;
 }
 
 /// Dispatch a framed request. Supports both:
@@ -220,8 +236,7 @@ pub(crate) async fn dispatch(
         (op, frame)
     };
 
-    let result =
-        handler::dispatch_operation(client, js, config, state, store, &op, payload).await;
+    let result = handler::dispatch_operation(client, js, config, state, store, &op, payload).await;
 
     match result {
         Ok(json) => (0, json),

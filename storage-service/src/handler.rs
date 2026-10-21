@@ -55,6 +55,9 @@ const MAX_TABLE_LEN: usize = 128;
 /// Maximum number of entries in a batch.put request.
 const MAX_BATCH_SIZE: usize = 256;
 
+/// Maximum raw JSON request payload size (8 MiB) enforced before JSON parsing.
+pub(crate) const MAX_RAW_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+
 /// Max number of watcher polling intervals before forcing a table reload.
 const DEFAULT_CONSISTENCY_WATCHER_WAIT_STEPS: u32 = 2;
 /// Duration of each watcher polling interval.
@@ -84,9 +87,7 @@ pub(crate) fn encryption_available() -> bool {
 pub(crate) fn init_encryption_mode() -> Result<(), String> {
     if let Some(key) = crate::vault::try_load_master_key() {
         let _ = MASTER_KEY.set(key);
-        eprintln!(
-            "lattice-db: encryption at rest ENABLED (AES-256-GCM, default for all tables)"
-        );
+        eprintln!("lattice-db: encryption at rest ENABLED (AES-256-GCM, default for all tables)");
         if crate::vault::migration_permitted() {
             eprintln!(
                 "lattice-db: WARNING — LDB_MIGRATE_PLAINTEXT is set: legacy plaintext values \
@@ -241,7 +242,11 @@ fn consistency_watcher_wait_steps() -> u32 {
     static STEPS: OnceLock<u32> = OnceLock::new();
     *STEPS.get_or_init(|| {
         env_u32(
-            &["JETCACHE_CONSISTENCY_WATCHER_WAIT_STEPS", "CACHE_CONSISTENCY_WATCHER_WAIT_STEPS", "LDB_CONSISTENCY_WATCHER_WAIT_STEPS"],
+            &[
+                "JETCACHE_CONSISTENCY_WATCHER_WAIT_STEPS",
+                "CACHE_CONSISTENCY_WATCHER_WAIT_STEPS",
+                "LDB_CONSISTENCY_WATCHER_WAIT_STEPS",
+            ],
             DEFAULT_CONSISTENCY_WATCHER_WAIT_STEPS,
             0,
             60,
@@ -253,7 +258,11 @@ fn consistency_watcher_wait_step_secs() -> u64 {
     static SECS: OnceLock<u64> = OnceLock::new();
     *SECS.get_or_init(|| {
         env_u64(
-            &["JETCACHE_CONSISTENCY_WATCHER_WAIT_STEP_SECS", "CACHE_CONSISTENCY_WATCHER_WAIT_STEP_SECS", "LDB_CONSISTENCY_WATCHER_WAIT_STEP_SECS"],
+            &[
+                "JETCACHE_CONSISTENCY_WATCHER_WAIT_STEP_SECS",
+                "CACHE_CONSISTENCY_WATCHER_WAIT_STEP_SECS",
+                "LDB_CONSISTENCY_WATCHER_WAIT_STEP_SECS",
+            ],
             DEFAULT_CONSISTENCY_WATCHER_WAIT_STEP_SECS,
             0,
             30,
@@ -530,6 +539,13 @@ pub async fn dispatch_operation(
     op: &str,
     payload: &[u8],
 ) -> Result<Vec<u8>, (u16, String)> {
+    if payload.len() > MAX_RAW_PAYLOAD_BYTES {
+        return Err((
+            400,
+            format!("request payload exceeds maximum of {MAX_RAW_PAYLOAD_BYTES} bytes"),
+        ));
+    }
+
     // Auth check.
     if let Some(ref token) = config.auth_token {
         if let Err(e) = check_auth(payload, token) {
@@ -556,7 +572,9 @@ pub async fn dispatch_operation(
         "keys" => handle_keys(state, store, payload).await,
         "prefix" => handle_prefix(state, store, payload).await,
         "batch.get" | "batch_get" => handle_batch_get(state, store, payload).await,
-        "batch.put" | "batch_put" => handle_batch_put(client, state, store, payload, instance).await,
+        "batch.put" | "batch_put" => {
+            handle_batch_put(client, state, store, payload, instance).await
+        }
         "schema.set" | "schema_set" => handle_schema_set(state, store, payload).await,
         "schema.get" | "schema_get" => handle_schema_get(state, payload),
         "schema.delete" | "schema_delete" => handle_schema_delete(state, store, payload).await,
@@ -620,6 +638,8 @@ async fn ensure_loaded(
     state: &SharedState,
     store: &SharedStore,
 ) -> Result<(), String> {
+    validate_table_name(table)?;
+
     // Two independent invariants must hold after this returns:
     //   1. The table's data is loaded into the in-memory cache.
     //   2. A background watcher is running so future writes from peer
@@ -644,20 +664,36 @@ async fn ensure_loaded(
         (needs_load, needs_watcher, currently_loading)
     };
 
-    if !needs_load && !needs_watcher {
-        if is_loading {
-            // Another task is currently loading this table — wait for it.
-            loop {
-                let done = {
-                    let s = state.borrow();
-                    s.tables.get(table).map_or(true, |t| t.loaded || !t.loading)
-                };
-                if done {
-                    break;
-                }
-                wasip3::clocks::monotonic_clock::wait_for(1_000_000).await; // 1ms yield
+    if is_loading {
+        // Another task is currently loading this table — wait for it to finish
+        // before deciding whether a watcher still needs to be spawned.
+        loop {
+            let done = {
+                let s = state.borrow();
+                s.tables.get(table).map_or(true, |t| !t.loading)
+            };
+            if done {
+                break;
             }
+            wasip3::clocks::monotonic_clock::wait_for(1_000_000).await; // 1ms yield
         }
+        let (loaded, watching) = {
+            let s = state.borrow();
+            let t = s.tables.get(table);
+            (
+                t.map_or(false, |t| t.loaded),
+                t.map_or(false, |t| t.watching),
+            )
+        };
+        if !loaded {
+            return Err(format!("load table '{table}': concurrent load failed"));
+        }
+        if watching || !needs_watcher {
+            return Ok(());
+        }
+    }
+
+    if !needs_load && !needs_watcher {
         return Ok(());
     }
 
@@ -679,21 +715,6 @@ async fn ensure_loaded(
         wasip3::spawn_local(async move {
             run_table_watcher(kv, &table_name, &watch_state, max_rev).await;
         });
-        return Ok(());
-    }
-
-    // Also need to wait if another task is loading (and we need a watcher).
-    if is_loading {
-        loop {
-            let done = {
-                let s = state.borrow();
-                s.tables.get(table).map_or(true, |t| t.loaded || !t.loading)
-            };
-            if done {
-                break;
-            }
-            wasip3::clocks::monotonic_clock::wait_for(1_000_000).await; // 1ms yield
-        }
         return Ok(());
     }
 
@@ -735,6 +756,9 @@ async fn ensure_loaded(
     ts.loaded = true;
     ts.loading = false;
     ts.note_applied_revision(snapshot_last_seq);
+    if needs_watcher {
+        ts.watching = true;
+    }
     let max_rev = snapshot_last_seq;
     drop(s);
 
@@ -748,7 +772,6 @@ async fn ensure_loaded(
     }
 
     if needs_watcher {
-        state.borrow_mut().table(table).watching = true;
         let watch_state = state.clone();
         let table_name = table.to_string();
         wasip3::spawn_local(async move {
@@ -920,7 +943,11 @@ pub(crate) fn set_data_epoch(epoch: String) {
 fn data_epoch() -> Option<String> {
     DATA_EPOCH.with(|e| {
         let s = e.borrow();
-        if s.is_empty() { None } else { Some(s.clone()) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.clone())
+        }
     })
 }
 
@@ -1038,6 +1065,8 @@ pub(crate) async fn handle_get(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: KeyReq = parse_req(payload)?;
+    validate_table_name(&req.table)?;
+    validate_key_name(&req.key)?;
     ensure_min_revision(&req.table, &req.consistency, state, store).await?;
 
     let s = state.borrow();
@@ -1116,6 +1145,8 @@ pub(crate) async fn handle_delete(
     instance: &str,
 ) -> Result<Vec<u8>, String> {
     let req: KeyReq = parse_req(payload)?;
+    validate_table_name(&req.table)?;
+    validate_key_name(&req.key)?;
     ensure_min_revision(&req.table, &req.consistency, state, store).await?;
 
     let kv = crate::store::get_or_create_kv(store, &req.table)
@@ -1138,23 +1169,39 @@ pub(crate) async fn handle_cas_delete(
     instance: &str,
 ) -> Result<Vec<u8>, String> {
     let req: CasDeleteReq = parse_req(payload)?;
+    validate_table_name(&req.table)?;
+    validate_key_name(&req.key)?;
     ensure_loaded(&req.table, state, store).await?;
 
     let kv = crate::store::get_or_create_kv(store, &req.table)
         .await
         .map_err(|e| format!("{e}"))?;
+    let encrypted = state.borrow().is_encrypted(&req.table);
     // CAS delete — only tombstone if the current revision matches.
     match kv.delete_expect_revision(&req.key, req.revision).await {
         Ok(()) => {}
         Err(e) => {
             // On CAS failure, re-fetch the winning value so the client's next
-            // retry sees the current revision immediately.
+            // retry sees the current revision immediately. Decrypt before caching
+            // so encrypted tables never store raw ciphertext envelopes in memory.
             if let Ok(Some(current)) = kv.get(&req.key).await {
-                state.borrow_mut().table(&req.table).upsert(
-                    &req.key,
-                    current.value,
-                    current.revision,
-                );
+                match decrypt_stored(&req.table, &req.key, current.value, encrypted) {
+                    Ok(StoredValue::Fresh(plaintext))
+                    | Ok(StoredValue::LegacyPlaintext(plaintext)) => {
+                        state.borrow_mut().table(&req.table).upsert(
+                            &req.key,
+                            plaintext,
+                            current.revision,
+                        );
+                    }
+                    Err(dec_err) => {
+                        eprintln!(
+                            "lattice-db: cas_delete fallback decrypt failed {table}:{key}: {dec_err}",
+                            table = req.table,
+                            key = req.key
+                        );
+                    }
+                }
             }
             return Err(format!("{e}"));
         }
@@ -1174,6 +1221,8 @@ pub(crate) async fn handle_purge(
     instance: &str,
 ) -> Result<Vec<u8>, String> {
     let req: PurgeReq = parse_req(payload)?;
+    validate_table_name(&req.table)?;
+    validate_key_name(&req.key)?;
     ensure_loaded(&req.table, state, store).await?;
 
     let kv = crate::store::get_or_create_kv(store, &req.table)
@@ -1208,6 +1257,8 @@ pub(crate) async fn handle_get_revision(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: GetRevisionReq = parse_req(payload)?;
+    validate_table_name(&req.table)?;
+    validate_key_name(&req.key)?;
     ensure_min_revision(&req.table, &req.consistency, state, store).await?;
 
     let kv = crate::store::get_or_create_kv(store, &req.table)
@@ -1227,9 +1278,18 @@ pub(crate) async fn handle_get_revision(
         _ => "unknown",
     };
 
+    let encrypted = state.borrow().is_encrypted(&req.table);
+    let plaintext = if matches!(entry.operation, nats_wasi::kv::Operation::Put) {
+        match decrypt_stored(&req.table, &req.key, entry.value, encrypted)? {
+            StoredValue::Fresh(p) | StoredValue::LegacyPlaintext(p) => p,
+        }
+    } else {
+        entry.value
+    };
+
     ok_json(&RevisionEntryResp {
         key: entry.key,
-        value: B64.encode(&entry.value),
+        value: B64.encode(&plaintext),
         revision: entry.revision,
         operation: operation.to_string(),
     })
@@ -1376,6 +1436,8 @@ pub(crate) async fn handle_exists(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: KeyReq = parse_req(payload)?;
+    validate_table_name(&req.table)?;
+    validate_key_name(&req.key)?;
     ensure_min_revision(&req.table, &req.consistency, state, store).await?;
 
     let exists = {
@@ -1394,6 +1456,7 @@ pub(crate) async fn handle_keys(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: KeysReq = parse_req(payload)?;
+    validate_table_name(&req.table)?;
     ensure_min_revision(&req.table, &req.consistency, state, store).await?;
 
     let s = state.borrow();
@@ -1423,6 +1486,7 @@ pub(crate) async fn handle_prefix(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: PrefixReq = parse_req(payload)?;
+    validate_table_name(&req.table)?;
     ensure_min_revision(&req.table, &req.consistency, state, store).await?;
     ensure_loaded(&req.table, state, store).await?;
 
@@ -1454,6 +1518,10 @@ pub(crate) async fn handle_batch_get(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: BatchGetReq = parse_req(payload)?;
+    validate_table_name(&req.table)?;
+    for key in &req.keys {
+        validate_key_name(key)?;
+    }
     ensure_min_revision(&req.table, &req.consistency, state, store).await?;
 
     let s = state.borrow();
@@ -1488,6 +1556,7 @@ pub(crate) async fn handle_batch_put(
     instance: &str,
 ) -> Result<Vec<u8>, String> {
     let req: BatchPutReq = parse_req(payload)?;
+    validate_table_name(&req.table)?;
     if req.entries.len() > MAX_BATCH_SIZE {
         return Err(format!("batch exceeds maximum of {MAX_BATCH_SIZE} entries"));
     }
@@ -1556,8 +1625,6 @@ pub(crate) async fn handle_batch_put(
     })
 }
 
-
-
 // ── Schema management ──────────────────────────────────────────────
 
 pub(crate) async fn handle_schema_set(
@@ -1566,6 +1633,7 @@ pub(crate) async fn handle_schema_set(
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: SchemaSetReq = parse_req(payload)?;
+    validate_table_name(&req.table)?;
     if let Some(fields) = req.schema.get("fields") {
         if !fields.is_object() {
             return Err("schema.fields must be an object".into());
@@ -1611,6 +1679,20 @@ pub(crate) async fn handle_schema_set(
         None => crate::state::default_encrypted(),
     };
 
+    // Refuse to downgrade an already-encrypted non-empty table to plaintext,
+    // which would cause subsequent reads/reloads to return raw ciphertext envelopes.
+    {
+        let s = state.borrow();
+        if let Some(t) = s.tables.get(&req.table) {
+            if t.encrypted && !encrypted && !t.data.is_empty() {
+                return Err(format!(
+                    "cannot disable encryption on non-empty table '{}'",
+                    req.table
+                ));
+            }
+        }
+    }
+
     let kv = crate::store::get_or_create_kv(store, "_schemas")
         .await
         .map_err(|e| format!("{e}"))?;
@@ -1626,6 +1708,7 @@ pub(crate) async fn handle_schema_set(
 
 pub(crate) fn handle_schema_get(state: &SharedState, payload: &[u8]) -> Result<Vec<u8>, String> {
     let req: TableReq = parse_req(payload)?;
+    validate_table_name(&req.table)?;
     let s = state.borrow();
     let schema = s
         .tables
@@ -1635,17 +1718,17 @@ pub(crate) fn handle_schema_get(state: &SharedState, payload: &[u8]) -> Result<V
     ok_json(&SchemaResp { schema })
 }
 
-
 pub(crate) async fn handle_schema_delete(
     state: &SharedState,
     store: &SharedStore,
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let req: TableReq = parse_req(payload)?;
+    validate_table_name(&req.table)?;
     let kv = crate::store::get_or_create_kv(store, "_schemas")
         .await
         .map_err(|e| format!("{e}"))?;
-    let _ = kv.delete(&req.table).await;
+    kv.delete(&req.table).await.map_err(|e| format!("{e}"))?;
 
     state.borrow_mut().table(&req.table).schema = None;
     ok_json(&EmptyResp {})
@@ -1708,16 +1791,54 @@ pub(crate) fn check_no_reserved_tables(_op: &str, payload: &[u8]) -> Result<(), 
     Ok(())
 }
 
-/// S-04: validate key and decoded-value sizes before writing to NATS KV.
-pub(crate) fn validate_write_bounds(table: &str, key: &str, value: &[u8]) -> Result<(), String> {
+/// Validate a table name for NATS KV bucket and subject safety.
+pub(crate) fn validate_table_name(table: &str) -> Result<(), String> {
+    if table.is_empty() {
+        return Err("table name cannot be empty".into());
+    }
     if table.len() > MAX_TABLE_LEN {
         return Err(format!(
             "table name exceeds maximum length of {MAX_TABLE_LEN}"
         ));
     }
+    if !table
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(format!(
+            "invalid table name '{table}': only ASCII alphanumeric, '_', and '-' are allowed"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a key name for NATS KV subject safety (no wildcards, empty tokens, or control chars).
+pub(crate) fn validate_key_name(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("key cannot be empty".into());
+    }
     if key.len() > MAX_KEY_LEN {
         return Err(format!("key exceeds maximum length of {MAX_KEY_LEN}"));
     }
+    if key.starts_with('.') || key.ends_with('.') || key.contains("..") {
+        return Err(format!(
+            "invalid key '{key}': cannot start/end with '.' or contain '..'"
+        ));
+    }
+    for b in key.bytes() {
+        if b == b'*' || b == b'>' || b <= 0x20 || b == 0x7f {
+            return Err(format!(
+                "invalid key '{key}': wildcards, whitespace, and control characters are not allowed"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// S-04: validate table/key syntax and decoded-value sizes before writing to NATS KV.
+pub(crate) fn validate_write_bounds(table: &str, key: &str, value: &[u8]) -> Result<(), String> {
+    validate_table_name(table)?;
+    validate_key_name(key)?;
     if value.len() > MAX_VALUE_BYTES {
         return Err(format!(
             "value exceeds maximum size of {} bytes",
@@ -1740,14 +1861,16 @@ pub(crate) fn check_auth(payload: &[u8], expected: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Constant-time byte-slice equality. Prevents timing-based token oracle attacks (S-03).
+/// Constant-time byte-slice equality. Hashes both inputs with SHA-256 and compares
+/// the 32-byte digests in constant time so neither prefix nor length is leaked via timing (S-03).
 pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+    use sha2::{Digest, Sha256};
+    let ha = Sha256::digest(a);
+    let hb = Sha256::digest(b);
+    let mut diff = 0u8;
+    for (x, y) in ha.iter().zip(hb.iter()) {
+        diff |= x ^ y;
     }
-    let mut acc = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        acc |= x ^ y;
-    }
-    acc == 0
+    let len_eq = a.len() == b.len();
+    diff == 0 && len_eq
 }

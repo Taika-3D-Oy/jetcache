@@ -12,6 +12,7 @@
 #   bash deploy/deploy-local.sh status     # show cluster status
 
 set -euo pipefail
+umask 077
 cd "$(dirname "$0")/.."
 
 CLUSTER_NAME="lattice-db"
