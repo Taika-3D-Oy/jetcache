@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.0-rc.5] - 2026-10-29
+
+### Fixed
+
+- **Prevent Permanent NATS KV Tombstone Accumulation on Delete**:
+  - Updated `handle_delete`, `handle_cas_delete`, `handle_purge`, and `handle_schema_delete` in `storage-service` to use `kv.purge_with_ttl(..., secs(60))` and `kv.purge_expect_revision_with_ttl(..., secs(60))` instead of `kv.delete`, rolling up prior revisions for deleted keys and expiring tombstone markers after 60 seconds so high-churn single-use keys do not accumulate indefinitely in JetStream KV buckets.
+
 ## [2.0.0-rc.4] - 2026-10-21
 
 ### Security

@@ -1152,7 +1152,11 @@ pub(crate) async fn handle_delete(
     let kv = crate::store::get_or_create_kv(store, &req.table)
         .await
         .map_err(|e| format!("{e}"))?;
-    kv.delete(&req.key).await.map_err(|e| format!("{e}"))?;
+    // Roll up prior revisions and expire the tombstone marker after 60s so
+    // watchers observe the removal without leaving permanent tombstones in KV.
+    kv.purge_with_ttl(&req.key, secs(60))
+        .await
+        .map_err(|e| format!("{e}"))?;
 
     // Update cache.
     state.borrow_mut().table(&req.table).remove(&req.key);
@@ -1177,8 +1181,12 @@ pub(crate) async fn handle_cas_delete(
         .await
         .map_err(|e| format!("{e}"))?;
     let encrypted = state.borrow().is_encrypted(&req.table);
-    // CAS delete — only tombstone if the current revision matches.
-    match kv.delete_expect_revision(&req.key, req.revision).await {
+    // CAS purge with 60s tombstone TTL — only remove if the current revision
+    // matches, and allow JetStream to reap the tombstone marker after 60s.
+    match kv
+        .purge_expect_revision_with_ttl(&req.key, req.revision, secs(60))
+        .await
+    {
         Ok(()) => {}
         Err(e) => {
             // On CAS failure, re-fetch the winning value so the client's next
@@ -1229,20 +1237,16 @@ pub(crate) async fn handle_purge(
         .await
         .map_err(|e| format!("{e}"))?;
 
-    match (req.revision, req.ttl_seconds) {
-        (Some(rev), Some(ttl)) => kv
+    let ttl = req.ttl_seconds.unwrap_or(60);
+    match req.revision {
+        Some(rev) => kv
             .purge_expect_revision_with_ttl(&req.key, rev, secs(ttl))
             .await
             .map_err(|e| format!("{e}"))?,
-        (Some(rev), None) => kv
-            .purge_expect_revision(&req.key, rev)
-            .await
-            .map_err(|e| format!("{e}"))?,
-        (None, Some(ttl)) => kv
+        None => kv
             .purge_with_ttl(&req.key, secs(ttl))
             .await
             .map_err(|e| format!("{e}"))?,
-        (None, None) => kv.purge(&req.key).await.map_err(|e| format!("{e}"))?,
     };
 
     state.borrow_mut().table(&req.table).remove(&req.key);
@@ -1728,7 +1732,9 @@ pub(crate) async fn handle_schema_delete(
     let kv = crate::store::get_or_create_kv(store, "_schemas")
         .await
         .map_err(|e| format!("{e}"))?;
-    kv.delete(&req.table).await.map_err(|e| format!("{e}"))?;
+    kv.purge_with_ttl(&req.table, secs(60))
+        .await
+        .map_err(|e| format!("{e}"))?;
 
     state.borrow_mut().table(&req.table).schema = None;
     ok_json(&EmptyResp {})
