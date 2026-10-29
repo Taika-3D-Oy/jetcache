@@ -1,6 +1,6 @@
 //! # jetcache-client
 //!
-//! Typed Rust SDK for [jetcache](https://github.com/Taika-3D-Oy/jetcache) (formerly `lattice-db`) —
+//! Typed Rust SDK for **jetcache** (formerly `lattice-db`) —
 //! an in-memory read-through cache for wasmCloud backed by NATS JetStream KV.
 //!
 //! Wraps the NATS request/reply wire protocol with ergonomic Rust methods.
@@ -447,8 +447,6 @@ pub struct LatticeDb {
 
 /// Primary client struct for jetcache.
 pub type JetCache = LatticeDb;
-/// Backwards-compatible alias for JetCache.
-pub type TaikaCache = LatticeDb;
 /// Backwards-compatible alias for JetCache.
 pub type LatticeCache = LatticeDb;
 

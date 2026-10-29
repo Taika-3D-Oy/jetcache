@@ -90,9 +90,9 @@ default for every table** and is a deployment-level property:
 ### Rust Client
 
 ```rust
-use lattice_db_client::TaikaCache; // or LatticeDb
+use jetcache_client::JetCache; // or LatticeDb
 
-let cache = TaikaCache::new(client)
+let cache = JetCache::new(client)
     .with_instance("lid")
     .with_auth("secret");
 

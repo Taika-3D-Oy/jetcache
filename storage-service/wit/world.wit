@@ -1,4 +1,4 @@
-package taika3d:ldb;
+package jetcache:storage;
 
 world storage-service {
     import wasi:clocks/wall-clock@0.3.0;

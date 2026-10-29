@@ -1,6 +1,6 @@
 # jetcache-client
 
-Typed Rust SDK for [jetcache](https://github.com/Taika-3D-Oy/jetcache) (formerly `lattice-db`) — an in-memory read-through cache for wasmCloud backed by NATS JetStream KV.
+Typed Rust SDK for **jetcache** (formerly `lattice-db`) — an in-memory read-through cache for wasmCloud backed by NATS JetStream KV.
 
 Wraps the NATS request/reply wire protocol so you can call `put`, `get`, `create`, `cas`, `prefix`, etc. with strongly-typed Rust methods instead of hand-rolling JSON payloads.
 

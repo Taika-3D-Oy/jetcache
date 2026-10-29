@@ -5,9 +5,6 @@ on:
     branches: [master]
     tags: ["v*"]
 
-env:
-  OCI_IMAGE: ghcr.io/taika-3d-oy/jetcache/storage-service
-
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -49,6 +46,7 @@ jobs:
 
       - name: Push to GHCR
         run: |
+          repo_lc="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           oras push \
-            "$OCI_IMAGE:${{ steps.tag.outputs.version }}" \
+            "ghcr.io/${repo_lc}/storage-service:${{ steps.tag.outputs.version }}" \
             target/wasm32-wasip2/release/storage_service.wasm:application/wasm

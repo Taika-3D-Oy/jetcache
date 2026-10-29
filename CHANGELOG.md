@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.0-rc.6] - 2026-10-29
+
+### Changed
+
+- **Vendor-Neutral Packaging & Documentation**:
+  - Updated `storage-service` WIT package identifier to `jetcache:storage`, removed deprecated vendor-prefixed client type alias, and standardized documentation and workflow metadata.
+
 ## [2.0.0-rc.5] - 2026-10-29
 
 ### Fixed
@@ -61,8 +68,7 @@
 - **Rebranded to `jetcache`**:
   - Rebranded project from `lattice-db` to `jetcache`, aligning with wasmCloud 2.0+ and NATS JetStream KV architecture.
   - Renamed client crate to `jetcache-client` on crates.io.
-  - Added `JetCache` as primary client struct with `TaikaCache` and `LatticeDb` type aliases for backward compatibility.
-  - Updated GitHub repository links to `https://github.com/Taika-3D-Oy/jetcache`.
+  - Added `JetCache` as primary client struct with `LatticeCache` and `LatticeDb` type aliases for backward compatibility.
 
 - **Pruned Unused Subsystems & Transitioned to Pure In-Memory Read-Through Cache**:
   - Removed `lattice-sql` and `lattice-sql-client` crates from workspace.
@@ -90,7 +96,7 @@
 
 - **Automated Crates.io & OCI Release Pipelines**:
   - Configured GitHub Actions workflow (`publish-clients.yml`) to publish `jetcache-client` to crates.io on `v*` tags or manual `workflow_dispatch`.
-  - Updated container image publishing in `release.yml` to `ghcr.io/taika-3d-oy/jetcache/storage-service`.
+  - Updated container image publishing in `release.yml` to `jetcache/storage-service`.
 
 ## [1.11.1] - 2026-09-23
 

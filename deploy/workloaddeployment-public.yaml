@@ -16,8 +16,8 @@ spec:
       # Your wasmCloud host must run with wasip2/3 enabled.
       components: []
       service:
-        # Replace with your published OCI reference/tag.
-        image: ghcr.io/taika-3d-oy/jetcache/storage-service:v2.0.0-rc.1
+        # Replace __GHCR_OWNER__ and tag with your published OCI reference.
+        image: ghcr.io/__GHCR_OWNER__/jetcache/storage-service:v2.0.0-rc.6
         maxRestarts: 5
         localResources:
           environment:
