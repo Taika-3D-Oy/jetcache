@@ -17,7 +17,7 @@ spec:
       components: []
       service:
         # Replace __GHCR_OWNER__ and tag with your published OCI reference.
-        image: ghcr.io/__GHCR_OWNER__/jetcache/storage-service:v2.0.0-rc.6
+        image: ghcr.io/__GHCR_OWNER__/jetcache/storage-service:v2.0.0-rc.7
         maxRestarts: 5
         localResources:
           environment:

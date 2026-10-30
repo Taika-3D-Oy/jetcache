@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.0-rc.7] - 2026-10-30
+
+### Removed
+
+- **Public Client SDK Release Pipeline**:
+  - Removed the `publish-clients.yml` GitHub Actions workflow so `jetcache-client` is no longer published to crates.io on tags or manual dispatches. The client remains internal while its public API is not yet supported for external use; GHCR publishing for `storage-service` is unchanged.
+
 ## [2.0.0-rc.6] - 2026-10-29
 
 ### Changed
